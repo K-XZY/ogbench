@@ -18,7 +18,12 @@ from absl import app, flags
 from PIL import Image, ImageDraw
 
 import ogbench.manipspace  # noqa
-from ogbench.manipspace.envs.manipspace_env import DEFAULT_RENDER_ZNEAR, DEFAULT_WRIST_CAMERA, ManipSpaceEnv
+from ogbench.manipspace.envs.manipspace_env import (
+    DEFAULT_RENDER_LIGHTING,
+    DEFAULT_RENDER_ZNEAR,
+    DEFAULT_WRIST_CAMERA,
+    ManipSpaceEnv,
+)
 from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
 
 FLAGS = flags.FLAGS
@@ -31,6 +36,9 @@ flags.DEFINE_integer('num_stat_resets', 20, 'Number of resets to measure framing
 flags.DEFINE_integer('max_episode_steps', 300, 'Cap on the demo episode used for the contact sheet.')
 flags.DEFINE_bool('lighting', True, 'Whether to enable the extra render lighting.')
 flags.DEFINE_string('rollout_path', None, 'If set, save the demo oracle rollout as an npz for Lane B.')
+flags.DEFINE_float('headlight_ambient', None, 'Override the headlight ambient level.')
+flags.DEFINE_float('headlight_diffuse', None, 'Override the headlight diffuse level.')
+flags.DEFINE_float('workspace_diffuse', None, 'Override the workspace fill light diffuse level.')
 
 # The wrist camera is mounted off one side of the gripper `base` frame. Which side is clean and which
 # is behind a linkage is not answerable from the MJCF, so render both and look.
@@ -48,6 +56,55 @@ WRIST_VARIANTS = {
 }
 
 
+def lighting_config():
+    """Assemble the render lighting from flags, so levels can be swept without editing code."""
+    if not FLAGS.lighting:
+        return None
+
+    config = {k: dict(v) if isinstance(v, dict) else v for k, v in DEFAULT_RENDER_LIGHTING.items()}
+    if FLAGS.headlight_ambient is not None:
+        config['headlight_ambient'] = FLAGS.headlight_ambient
+    if FLAGS.headlight_diffuse is not None:
+        config['headlight_diffuse'] = FLAGS.headlight_diffuse
+    if FLAGS.workspace_diffuse is not None:
+        config['workspace_light']['diffuse'] = (FLAGS.workspace_diffuse,) * 3
+    return config
+
+
+def cube_color_fidelity(env, frames):
+    """Measure whether cube colours survive the exposure.
+
+    Cube colour is the object identity signal -- the dataset records a colour name per cube index and
+    any later labelling leans on it -- so brightness that clips saturated colours toward white costs
+    more than it buys. Reported per frame: the fraction of pixels clipping, and the mean HSV
+    saturation of pixels whose hue matches a known cube colour.
+    """
+    unwrapped = env.unwrapped
+    cube_rgb = (unwrapped._cube_colors[: unwrapped._num_cubes, :3] * 255.0).astype(np.float32)
+    cube_unit = cube_rgb / np.linalg.norm(cube_rgb, axis=1, keepdims=True)
+
+    out = {}
+    for name, frame in frames.items():
+        arr = frame.astype(np.float32)
+        hi = arr.max(axis=-1)
+        lo = arr.min(axis=-1)
+
+        flat = arr.reshape(-1, 3)
+        norms = np.linalg.norm(flat, axis=1, keepdims=True)
+        unit = flat / np.clip(norms, 1e-6, None)
+        # Match on hue direction only, so a washed-out cube still counts as a cube pixel and drags
+        # the saturation number down instead of quietly dropping out of the population.
+        is_cube = ((unit @ cube_unit.T).max(axis=1) > 0.995) & (norms[:, 0] > 40)
+
+        sat = np.where(hi > 0, (hi - lo) / np.clip(hi, 1e-6, None), 0.0).reshape(-1)
+        out[name] = dict(
+            frac_clipped=float((hi >= 250).mean()),
+            cube_pixel_frac=float(is_cube.mean()),
+            mean_cube_saturation=float(sat[is_cube].mean()) if is_cube.any() else 0.0,
+        )
+    return out
+
+
 def make_env(wrist_camera, render_camera_names):
     """Build a data-collection env on the VLA render path."""
     return gymnasium.make(
@@ -63,7 +120,7 @@ def make_env(wrist_camera, render_camera_names):
         wrist_camera=wrist_camera,
         overhead_camera=True,
         visual_znear=DEFAULT_RENDER_ZNEAR,
-        render_lighting=True if FLAGS.lighting else None,
+        render_lighting=lighting_config(),
         pixel_recolor_arm=False,
         pixel_transparent_arm=False,
     )
@@ -137,7 +194,8 @@ def cube_pixel_coverage(env, frames):
 def collect_stats(env, camera_names, num_resets):
     """Measure cube visibility and brightness across resets."""
     per_camera = {
-        name: dict(visible_counts=[], mean_full=[], mean_center=[], workspace_frac=[]) for name in camera_names
+        name: dict(visible_counts=[], mean_full=[], mean_center=[], workspace_frac=[], clipped=[], cube_sat=[])
+        for name in camera_names
     }
 
     for i in range(num_resets):
@@ -145,6 +203,7 @@ def collect_stats(env, camera_names, num_resets):
         frames = env.unwrapped.render_cameras()
         visible = cube_pixel_coverage(env, frames)
         workspace = workspace_frame_fraction(env, frames)
+        fidelity = cube_color_fidelity(env, frames)
         for name, frame in frames.items():
             height, width = frame.shape[:2]
             quarter_h, quarter_w = height // 4, width // 4
@@ -155,6 +214,8 @@ def collect_stats(env, camera_names, num_resets):
             # frame, so report the centre crop too before concluding anything about lighting.
             per_camera[name]['mean_center'].append(float(center.mean()))
             per_camera[name]['workspace_frac'].append(workspace[name])
+            per_camera[name]['clipped'].append(fidelity[name]['frac_clipped'])
+            per_camera[name]['cube_sat'].append(fidelity[name]['mean_cube_saturation'])
 
     num_cubes = env.unwrapped._num_cubes
     summary = {}
@@ -169,6 +230,8 @@ def collect_stats(env, camera_names, num_resets):
             mean_brightness_center=float(np.mean(rec['mean_center'])),
             std_brightness_full=float(np.std(rec['mean_full'])),
             mean_workspace_frame_fraction=float(np.mean(rec['workspace_frac'])),
+            frac_pixels_clipped=float(np.mean(rec['clipped'])),
+            mean_cube_saturation=float(np.mean(rec['cube_sat'])),
         )
     return summary
 
