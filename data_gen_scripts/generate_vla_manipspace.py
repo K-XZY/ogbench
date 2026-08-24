@@ -98,6 +98,32 @@ def collect_provenance(writer_mod, repo_root, ogbench_root):
         return git_sha(repo_root), git_sha(ogbench_root), mujoco.__version__
 
 
+def measure_run_size(run_dir, num_episodes, num_steps):
+    """Bytes actually on disk, overall and by file type.
+
+    Measuring the trial's real size is the point of the trial (M3): the projection to a full run is
+    what decides whether the disk budget holds. Called before `close`, so `summary.json` and
+    `meta.json` are not yet counted -- both are small relative to video.
+    """
+    by_suffix = {}
+    total = 0
+    for path in pathlib.Path(run_dir).rglob('*'):
+        if not path.is_file():
+            continue
+        size = path.stat().st_size
+        total += size
+        by_suffix[path.suffix or '<none>'] = by_suffix.get(path.suffix or '<none>', 0) + size
+
+    return dict(
+        bytes_on_disk=total,
+        bytes_by_suffix=dict(sorted(by_suffix.items(), key=lambda kv: -kv[1])),
+        bytes_per_episode=total / max(num_episodes, 1),
+        bytes_per_step=total / max(num_steps, 1),
+        # At the released cube-triple play scale: 3000 episodes truncating at 1001 steps.
+        projected_bytes_3000_episodes=(total / max(num_steps, 1)) * 3000 * 1001,
+    )
+
+
 def run_config():
     """The full config, frozen to config.yaml by the writer. Section 3b: every run, no exceptions.
 
@@ -393,12 +419,16 @@ def main(_):
             segment_success_rate=(total_successes / total_segments) if total_segments else 0.0,
             mean_steps_per_episode=total_steps / max(FLAGS.num_episodes, 1),
             wall_time_s=time.time() - started,
+            steps_per_second=total_steps / max(time.time() - started, 1e-9),
             schema_version=schema.SCHEMA_VERSION,
             git_sha_parent=GIT_SHA_PARENT,
             git_sha_ogbench=GIT_SHA_OGBENCH,
             mujoco_version=mujoco_version,
             dry_run=FLAGS.dry_run,
         )
+        if run_writer is not None:
+            summary.update(measure_run_size(run_writer.run_dir, FLAGS.num_episodes, total_steps))
+
         print(json.dumps(summary, indent=2), flush=True)
 
         if run_writer is not None:
