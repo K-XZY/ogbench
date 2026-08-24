@@ -21,14 +21,30 @@ DEFAULT_WRIST_CAMERA = dict(
     fovy=65.0,
 )
 
-# Default pose of the optional `overhead` camera, in world coordinates. Top-down over the workspace
-# centre, looking straight down (-z). Image-right is world +y, matching the `front` cameras, so
-# image-up is world -x, i.e. toward the robot base. At 0.68 m above the table fovy=60 covers roughly
-# y in [-0.39, 0.39] and x in [0.03, 0.82], which holds the object sampling bounds with margin.
-# Config values, not literals: expected to be tuned from a render.
+# Default pose of the optional `overhead` camera, in world coordinates. Aimed at the workspace
+# centre (0.425, 0, 0.05) from 0.68 m, tilted 35 degrees off vertical toward -y. Image-up is world
+# -x, i.e. toward the robot base, matching the `front` cameras.
+#
+# **It is tilted, not straight down, and that is the whole point.** A camera directly above the
+# workspace centre shares its sight line with the arm's approach corridor, so the UR5e links hide
+# the cube being manipulated during exactly the phase the dataset exists to capture. Measured over
+# 7 seeds with a segmentation pass (`data_gen_scripts/sweep_overhead_camera.py`, metric identical to
+# `scripts/camera_audit.py`), target-cube visibility:
+#
+#   pose                     visible   worst seed   at grasp   longest blackout   seeds blacked out
+#   straight down (was)       61.7%       20.7%       59.1%        69 frames            6 of 7
+#   35 deg toward -y (now)    99.8%       98.9%      100.0%         1 frame             0 of 7
+#
+# Tilt distance is held at 0.68 m so the framing scale is unchanged; only the viewing angle moves.
+# Raising the camera would not have helped -- height does not move a shared axis.
+#
+# The tilt is lateral rather than toward +x on purpose. Tilting toward +x scores marginally better
+# (35 deg toward +x reaches 100%) but that is where `front` already sits at x=1.287, so it buys a
+# second `front` rather than a third viewpoint. -y beats +y measurably (99.8% against 98.7% at the
+# same angle), which is an arm-geometry asymmetry, not something derivable from the workspace.
 DEFAULT_OVERHEAD_CAMERA = dict(
-    pos=(0.425, 0.0, 0.7),
-    xyaxes=(0.0, 1.0, 0.0, -1.0, 0.0, 0.0),
+    pos=(0.425, -0.390032, 0.607023),
+    xyaxes=(0.0, 0.819152, 0.573576, -1.0, 0.0, 0.0),
     fovy=60.0,
 )
 

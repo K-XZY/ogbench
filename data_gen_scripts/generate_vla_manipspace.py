@@ -22,7 +22,6 @@ import contextlib
 import importlib
 import json
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -75,53 +74,15 @@ def _schema():
 schema = _schema()
 
 
-def git_sha(path):
-    try:
-        return subprocess.check_output(
-            ['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-    except (subprocess.CalledProcessError, OSError):
-        return ''
-
-
-def collect_provenance(writer_mod, repo_root, ogbench_root):
+def collect_provenance(writer_mod, repo_root):
     """The three fields that identify the data: parent SHA, ogbench SHA, MuJoCo version.
 
-    Prefers Lane B's collector, which also refuses a dirty tree. Falls back to reading the SHAs
-    directly while that is still a stub, so `--dry_run` works before the writer lands; the fallback
-    disappears on its own once `Provenance.collect` is implemented.
+    A dirty tree is fatal for a real run -- data attributed to a commit that was never committed is
+    not attributable -- but tolerated for `--dry_run`, which writes nothing and exists to be run
+    mid-edit. `allow_dirty` stamps a `-dirty` suffix, so a dry run's provenance can never be
+    mistaken for a clean one's.
     """
-    try:
-        prov = writer_mod.Provenance.collect(str(repo_root))
-        return prov.git_sha_parent, prov.git_sha_ogbench, prov.mujoco_version
-    except NotImplementedError:
-        return git_sha(repo_root), git_sha(ogbench_root), mujoco.__version__
-
-
-def measure_run_size(run_dir, num_episodes, num_steps):
-    """Bytes actually on disk, overall and by file type.
-
-    Measuring the trial's real size is the point of the trial (M3): the projection to a full run is
-    what decides whether the disk budget holds. Called before `close`, so `summary.json` and
-    `meta.json` are not yet counted -- both are small relative to video.
-    """
-    by_suffix = {}
-    total = 0
-    for path in pathlib.Path(run_dir).rglob('*'):
-        if not path.is_file():
-            continue
-        size = path.stat().st_size
-        total += size
-        by_suffix[path.suffix or '<none>'] = by_suffix.get(path.suffix or '<none>', 0) + size
-
-    return dict(
-        bytes_on_disk=total,
-        bytes_by_suffix=dict(sorted(by_suffix.items(), key=lambda kv: -kv[1])),
-        bytes_per_episode=total / max(num_episodes, 1),
-        bytes_per_step=total / max(num_steps, 1),
-        # At the released cube-triple play scale: 3000 episodes truncating at 1001 steps.
-        projected_bytes_3000_episodes=(total / max(num_steps, 1)) * 3000 * 1001,
-    )
+    return writer_mod.Provenance.collect(str(repo_root), allow_dirty=FLAGS.dry_run)
 
 
 def run_config():
@@ -364,7 +325,10 @@ def main(_):
     ogbench_root = pathlib.Path(__file__).resolve().parents[1]
     repo_root = ogbench_root.parents[1]
     writer_mod = importlib.import_module(WRITER_MODULE)
-    GIT_SHA_PARENT, GIT_SHA_OGBENCH, mujoco_version = collect_provenance(writer_mod, repo_root, ogbench_root)
+    provenance = collect_provenance(writer_mod, repo_root)
+    GIT_SHA_PARENT = provenance.git_sha_parent
+    GIT_SHA_OGBENCH = provenance.git_sha_ogbench
+    mujoco_version = provenance.mujoco_version
 
     np.random.seed(FLAGS.seed)
     env = make_env()
@@ -384,7 +348,7 @@ def main(_):
                     env_id=FLAGS.env_name,
                     oracle_type=FLAGS.dataset_type,
                     config=run_config(),
-                    provenance=writer_mod.Provenance.collect(str(repo_root)),
+                    provenance=provenance,
                 )
             )
             print(f'Run directory: {run_writer.run_dir}', flush=True)
@@ -426,9 +390,6 @@ def main(_):
             mujoco_version=mujoco_version,
             dry_run=FLAGS.dry_run,
         )
-        if run_writer is not None:
-            summary.update(measure_run_size(run_writer.run_dir, FLAGS.num_episodes, total_steps))
-
         print(json.dumps(summary, indent=2), flush=True)
 
         if run_writer is not None:
