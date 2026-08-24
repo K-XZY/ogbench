@@ -34,23 +34,36 @@ DEFAULT_OVERHEAD_CAMERA = dict(
 
 # Optional extra lighting for the VLA render path.
 #
-# Upstream is dim -- `front` averages ~46/255, about 18% of range, where natural photographs a
-# pretrained encoder was trained on sit nearer 45-50%. Note that the light-removal loop in
-# `build_mjcf_model` only strips lights from the *UR5e* MJCF (a single spotlight targeting
-# `wrist_2_link`); the arena keeps its `global` directional light and its `spotlight`. So this is
-# not restoring deleted lights, it is adding exposure on top of what already exists.
+# Note this does not restore deleted lights: the removal loop in `build_mjcf_model` strips lights
+# from the *UR5e* MJCF only (one spotlight targeting `wrist_2_link`), while the arena keeps its
+# `global` directional light, its `spotlight` and a headlight. The scene is dim, not unlit.
 #
-# `ambient` does the heavy lifting: it lifts shadowed regions, where the detail is lost, without
-# pushing already-lit metal toward clipping. The added area light over the workspace fills the
-# table. `castshadow` stays off so we do not introduce a second shadow that conflicts with the
-# existing ones.
+# These levels were picked from a sweep at 256x256 over 12 resets, measuring whole-frame mean,
+# clipped-pixel fraction and cube-colour saturation:
+#
+#   ambient/diffuse/fill   front mean   overhead clipped   cube saturation
+#   upstream               56.9 (22%)   9.05%              0.507
+#   0.15 / 0.65 / 0.20     64.1 (25%)   10.15%             0.507   <- this default
+#   0.25 / 0.70 / 0.30     68.3 (27%)   10.84%             0.505
+#   0.35 / 0.80 / 0.40     71.1 (28%)   11.34%             0.504
+#
+# Two things that curve settles. Whole-frame mean saturates around 28% however hard it is driven,
+# because most of the frame is intentionally dark floor and skybox -- so a "match natural images at
+# 45-50%" target is not reachable by lighting, and chasing it only buys clipping. And clipping is
+# the real cost: it rises monotonically and destroys information irreversibly, where darkness does
+# not, since encoders normalize their input. Hence the most conservative setting that still lifts
+# shadow detail.
+#
+# `ambient` does the useful work -- it lifts shadowed regions, where detail is actually lost,
+# without pushing lit metal further toward clipping. `castshadow` stays off so the fill light does
+# not introduce a second shadow conflicting with the existing ones.
 DEFAULT_RENDER_LIGHTING = dict(
-    headlight_diffuse=0.8,
-    headlight_ambient=0.35,
+    headlight_diffuse=0.65,
+    headlight_ambient=0.15,
     workspace_light=dict(
         pos=(0.425, 0.0, 1.0),
         dir=(0.0, 0.0, -1.0),
-        diffuse=(0.4, 0.4, 0.4),
+        diffuse=(0.2, 0.2, 0.2),
         specular=(0.0, 0.0, 0.0),
         cutoff=70.0,
         castshadow=False,
