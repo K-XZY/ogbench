@@ -95,6 +95,15 @@ CAMERA_ALIASES = {
     'wrist': 'ur5e/robotiq/wrist',
 }
 
+# Cameras whose pose is an env kwarg, and the kwarg that carries it. Anything not listed here is
+# fixed in the environment's own MJCF -- `front` is placed by `cube_env.add_objects` -- so a recorded
+# config can only *verify* it, never rebuild it. If a fixed camera disagrees with the record, the
+# ogbench SHA differs and the run genuinely cannot be reproduced; saying so is the point.
+CONFIGURABLE_CAMERAS = {
+    'wrist': 'wrist_camera',
+    'overhead': 'overhead_camera',
+}
+
 # `visual/map znear` is a *fraction of* `statistic.extent`, so the upstream 0.1 with extent 0.7
 # puts the near plane at 0.07 m -- which would slice off the proximal half of the fingers in the
 # wrist view. 0.02 puts it at 0.014 m. Only depth precision suffers, and we render RGB only.
@@ -764,3 +773,97 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             raise ValueError('No cameras to render; pass render_camera_names to the environment or camera_names here.')
 
         return {name: self.render(camera=self.resolve_camera_name(name), *args, **kwargs) for name in camera_names}
+
+
+def _quat_to_xyaxes(quat):
+    """MJCF `xyaxes` from a wxyz quaternion.
+
+    `xyaxes` is the camera's x and y axes expressed in its parent frame, which are the first two
+    columns of the rotation matrix the quaternion denotes.
+    """
+    w, x, y, z = (float(v) for v in quat)
+    rot = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    return tuple(rot[:, 0]) + tuple(rot[:, 1])
+
+
+def render_config_to_kwargs(render_config):
+    """Map a recorded `render_config` back to environment constructor kwargs.
+
+    `render_config` is a *description* read back from the compiled model, so it cannot be splatted
+    into a constructor directly -- it carries compiled camera quaternions and parent bodies, while
+    the constructor takes `xyaxes` and per-camera kwargs. This is the translation, and it lives here
+    rather than in any one consumer so that consumers cannot each invent a different one.
+
+    Cameras not in `CONFIGURABLE_CAMERAS` are omitted: they are fixed in the environment's MJCF and
+    are checked by `verify_render_config` instead of rebuilt.
+    """
+    kwargs = {
+        'render_camera_names': list(render_config['cameras']),
+        'width': render_config['image_width'],
+        'height': render_config['image_height'],
+        'visual_znear': render_config['visual_znear'],
+        'render_lighting': render_config['lighting'],
+        'visualize_info': render_config['visualize_info'],
+        'pixel_recolor_arm': render_config['pixel_recolor_arm'],
+        'pixel_transparent_arm': render_config['pixel_transparent_arm'],
+    }
+
+    for name, camera in render_config['cameras'].items():
+        kwarg = CONFIGURABLE_CAMERAS.get(name)
+        if kwarg is None:
+            continue
+        kwargs[kwarg] = dict(
+            pos=tuple(float(v) for v in camera['pos']),
+            xyaxes=_quat_to_xyaxes(camera['quat']),
+            fovy=float(camera['fovy']),
+        )
+
+    return kwargs
+
+
+def verify_render_config(env, recorded, atol=1e-5):
+    """Raise if `env`'s compiled render configuration disagrees with a recorded one.
+
+    This is the guarantee that makes `render_config_to_kwargs` worth anything: a helper that
+    reconstructs *something* is not the same as one that reconstructs *this*. Cameras fixed in the
+    MJCF are covered too -- they cannot be rebuilt, but a mismatch means the ogbench revision differs
+    and the run is not reproducible from this record, which the caller needs to be told.
+    """
+    actual = env.unwrapped.render_config if hasattr(env, 'unwrapped') else env.render_config
+    problems = []
+
+    if set(actual['cameras']) != set(recorded['cameras']):
+        problems.append(f"cameras {sorted(actual['cameras'])} != recorded {sorted(recorded['cameras'])}")
+
+    for name in set(actual['cameras']) & set(recorded['cameras']):
+        got, want = actual['cameras'][name], recorded['cameras'][name]
+        if got['mjcf_name'] != want['mjcf_name']:
+            problems.append(f"{name}: mjcf_name {got['mjcf_name']!r} != {want['mjcf_name']!r}")
+        if got['parent_body'] != want['parent_body']:
+            problems.append(f"{name}: parent_body {got['parent_body']!r} != {want['parent_body']!r}")
+        if not np.allclose(got['pos'], want['pos'], atol=atol):
+            problems.append(f"{name}: pos {got['pos']} != {want['pos']}")
+        # q and -q denote the same rotation, so compare the rotations, not the components.
+        if abs(abs(float(np.dot(got['quat'], want['quat']))) - 1.0) > atol:
+            problems.append(f"{name}: quat {got['quat']} != {want['quat']} (as rotations)")
+        if abs(got['fovy'] - want['fovy']) > atol:
+            problems.append(f"{name}: fovy {got['fovy']} != {want['fovy']}")
+
+    for key in ('image_height', 'image_width', 'visualize_info', 'pixel_recolor_arm',
+                'pixel_transparent_arm'):
+        if actual[key] != recorded[key]:
+            problems.append(f'{key}: {actual[key]!r} != {recorded[key]!r}')
+
+    for key in ('visual_znear', 'statistic_extent'):
+        if not np.isclose(actual[key], recorded[key], atol=atol):
+            problems.append(f'{key}: {actual[key]} != {recorded[key]}')
+
+    if actual['lighting'] != recorded['lighting']:
+        problems.append(f"lighting: {actual['lighting']} != {recorded['lighting']}")
+
+    if problems:
+        raise ValueError('render_config does not round-trip:\n  ' + '\n  '.join(problems))
