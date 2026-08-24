@@ -10,6 +10,7 @@ Run on the box:
 
 import json
 import pathlib
+from collections import defaultdict
 
 import gymnasium
 import numpy as np
@@ -28,6 +29,8 @@ flags.DEFINE_string('save_dir', None, 'Directory to write the contact sheet and 
 flags.DEFINE_integer('resolution', 256, 'Render resolution; the dataset master size.')
 flags.DEFINE_integer('num_stat_resets', 20, 'Number of resets to measure framing and brightness over.')
 flags.DEFINE_integer('max_episode_steps', 300, 'Cap on the demo episode used for the contact sheet.')
+flags.DEFINE_bool('lighting', True, 'Whether to enable the extra render lighting.')
+flags.DEFINE_string('rollout_path', None, 'If set, save the demo oracle rollout as an npz for Lane B.')
 
 # The wrist camera is mounted off one side of the gripper `base` frame. Which side is clean and which
 # is behind a linkage is not answerable from the MJCF, so render both and look.
@@ -60,9 +63,53 @@ def make_env(wrist_camera, render_camera_names):
         wrist_camera=wrist_camera,
         overhead_camera=True,
         visual_znear=DEFAULT_RENDER_ZNEAR,
+        render_lighting=True if FLAGS.lighting else None,
         pixel_recolor_arm=False,
         pixel_transparent_arm=False,
     )
+
+
+def project(model, data, cam_id, points, height, width):
+    """Project world points into pixel coordinates for one camera."""
+    cam_pos = data.cam_xpos[cam_id]
+    cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
+    focal = 0.5 * height / np.tan(0.5 * np.deg2rad(model.cam_fovy[cam_id]))
+
+    out = []
+    for xyz in points:
+        rel = cam_mat.T @ (np.asarray(xyz) - cam_pos)
+        depth = -rel[2]  # MuJoCo cameras look down -z of their own frame.
+        if depth <= 0:
+            continue
+        out.append((0.5 * width + focal * rel[0] / depth, 0.5 * height - focal * rel[1] / depth))
+    return out
+
+
+def workspace_frame_fraction(env, frames):
+    """Fraction of each frame spanned by the object sampling volume.
+
+    The axis-aligned pixel bounding box of the eight corners of the sampling volume, clipped to the
+    frame, over total image area. This is the number behind "the workspace fills a third of the
+    image", and it is what the overhead pose should be tuned against.
+    """
+    unwrapped = env.unwrapped
+    model, data = unwrapped._model, unwrapped._data
+    (x_lo, y_lo), (x_hi, y_hi) = unwrapped._object_sampling_bounds
+    corners = [(x, y, z) for x in (x_lo, x_hi) for y in (y_lo, y_hi) for z in (0.02, 0.10)]
+
+    fractions = {}
+    for name, frame in frames.items():
+        height, width = frame.shape[:2]
+        cam_id = model.camera(ManipSpaceEnv.resolve_camera_name(name)).id
+        pts = project(model, data, cam_id, corners, height, width)
+        if not pts:
+            fractions[name] = 0.0
+            continue
+        xs, ys = zip(*pts)
+        box_w = max(0.0, min(max(xs), width) - max(min(xs), 0.0))
+        box_h = max(0.0, min(max(ys), height) - max(min(ys), 0.0))
+        fractions[name] = float(box_w * box_h / (width * height))
+    return fractions
 
 
 def cube_pixel_coverage(env, frames):
@@ -78,37 +125,26 @@ def cube_pixel_coverage(env, frames):
     visible = {}
     for name, frame in frames.items():
         cam_id = model.camera(ManipSpaceEnv.resolve_camera_name(name)).id
-        # World -> camera frame.
-        cam_pos = data.cam_xpos[cam_id]
-        cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
-        fovy = np.deg2rad(model.cam_fovy[cam_id])
         height, width = frame.shape[:2]
-        focal = 0.5 * height / np.tan(0.5 * fovy)
-
-        count = 0
-        for i in range(num_cubes):
-            xyz = data.joint(f'object_joint_{i}').qpos[:3]
-            rel = cam_mat.T @ (xyz - cam_pos)
-            # MuJoCo cameras look down -z of their own frame.
-            depth = -rel[2]
-            if depth <= 0:
-                continue
-            px = 0.5 * width + focal * rel[0] / depth
-            py = 0.5 * height - focal * rel[1] / depth
-            if 0 <= px < width and 0 <= py < height:
-                count += 1
-        visible[name] = count
+        cubes = [data.joint(f'object_joint_{i}').qpos[:3] for i in range(num_cubes)]
+        pts = project(model, data, cam_id, cubes, height, width)
+        # An in-frame test, not a visibility test: a cube hidden behind the arm still counts. It
+        # bounds the framing question only; occlusion during a grasp is measured separately.
+        visible[name] = sum(1 for px, py in pts if 0 <= px < width and 0 <= py < height)
     return visible
 
 
 def collect_stats(env, camera_names, num_resets):
     """Measure cube visibility and brightness across resets."""
-    per_camera = {name: dict(visible_counts=[], mean_full=[], mean_center=[]) for name in camera_names}
+    per_camera = {
+        name: dict(visible_counts=[], mean_full=[], mean_center=[], workspace_frac=[]) for name in camera_names
+    }
 
     for i in range(num_resets):
         env.reset(seed=FLAGS.seed + 10_000 + i)
         frames = env.unwrapped.render_cameras()
         visible = cube_pixel_coverage(env, frames)
+        workspace = workspace_frame_fraction(env, frames)
         for name, frame in frames.items():
             height, width = frame.shape[:2]
             quarter_h, quarter_w = height // 4, width // 4
@@ -118,6 +154,7 @@ def collect_stats(env, camera_names, num_resets):
             # A whole-frame mean is dominated by dark floor and skybox when the workspace is small in
             # frame, so report the centre crop too before concluding anything about lighting.
             per_camera[name]['mean_center'].append(float(center.mean()))
+            per_camera[name]['workspace_frac'].append(workspace[name])
 
     num_cubes = env.unwrapped._num_cubes
     summary = {}
@@ -130,19 +167,35 @@ def collect_stats(env, camera_names, num_resets):
             min_cubes_in_frame=int(counts.min()),
             mean_brightness_full=float(np.mean(rec['mean_full'])),
             mean_brightness_center=float(np.mean(rec['mean_center'])),
+            std_brightness_full=float(np.std(rec['mean_full'])),
+            mean_workspace_frame_fraction=float(np.mean(rec['workspace_frac'])),
         )
     return summary
 
 
-def run_demo_episode(env, camera_names):
-    """Roll the plan oracle out and keep frames at reset, first grasp, mid-reach and episode end."""
+def run_demo_episode(env, camera_names, record_trajectory=False):
+    """Roll the plan oracle out, keeping key frames and optionally the whole trajectory.
+
+    The recorded trajectory is what Lane B measures grasp-time occlusion against: occlusion matters
+    when the arm is over the cube it is manipulating, which never happens at reset.
+    """
     unwrapped = env.unwrapped
     ob, info = env.reset(seed=FLAGS.seed)
     agent = CubePlanOracle(env=env, noise=0.0, noise_smoothing=0.5)
     agent.reset(ob, info)
 
-    keyframes = {'reset': env.unwrapped.render_cameras()}
+    frames = unwrapped.render_cameras()
+    keyframes = {'reset': frames}
+    traj = None
+    if record_trajectory:
+        traj = defaultdict(list)
+        traj['qpos'].append(info['qpos'])
+        traj['qvel'].append(info['qvel'])
+        for cam, frame in frames.items():
+            traj[f'frames/{cam}'].append(frame)
+
     grasp_captured = False
+    grasp_step = -1
     step = 0
     done = False
 
@@ -152,22 +205,36 @@ def run_demo_episode(env, camera_names):
         done = terminated or truncated
         step += 1
 
+        frames = None
+        if record_trajectory:
+            frames = unwrapped.render_cameras()
+            traj['actions'].append(action)
+            traj['qpos'].append(info['qpos'])
+            traj['qvel'].append(info['qvel'])
+            traj['gripper_contact'].append(info['proprio/gripper_contact'])
+            traj['target_block'].append(info['privileged/target_block'])
+            traj['segment_index'].append(info['privileged/segment_index'])
+            traj['segment_start'].append(info['privileged/segment_start'])
+            for cam, frame in frames.items():
+                traj[f'frames/{cam}'].append(frame)
+
         # First frame where the gripper is actually holding something: the wrist view's whole reason
         # for existing, so it is the frame worth judging its pose on.
         if not grasp_captured and info['proprio/gripper_contact'][0] > 0.5:
-            keyframes['grasp'] = unwrapped.render_cameras()
+            keyframes['grasp'] = frames if frames is not None else unwrapped.render_cameras()
             grasp_captured = True
+            grasp_step = step
 
         if step == FLAGS.max_episode_steps // 4:
-            keyframes['quarter'] = unwrapped.render_cameras()
+            keyframes['quarter'] = frames if frames is not None else unwrapped.render_cameras()
 
         if agent.done:
             break
 
-    keyframes['end'] = unwrapped.render_cameras()
+    keyframes['end'] = frames if frames is not None else unwrapped.render_cameras()
     if not grasp_captured:
         print('WARNING: no grasp detected; the wrist frames show no held cube.', flush=True)
-    return keyframes
+    return keyframes, traj, dict(num_steps=step, grasp_step=grasp_step)
 
 
 def build_contact_sheet(rows, camera_order, path, pad=6, label_h=22):
@@ -207,13 +274,30 @@ def main(_):
     base_cameras = ['front', 'overhead']
     all_rows = {}
     stats = {}
+    lighting_used = None
 
     for variant, wrist_camera in WRIST_VARIANTS.items():
         # The camera pose is baked into the compiled model, so each wrist side needs its own env.
         env = make_env(wrist_camera, base_cameras + ['wrist'])
 
         variant_stats = collect_stats(env, base_cameras + ['wrist'], FLAGS.num_stat_resets)
-        keyframes = run_demo_episode(env, base_cameras + ['wrist'])
+        # Only the default wrist side is worth saving a full rollout for.
+        want_traj = FLAGS.rollout_path is not None and variant == 'wrist_negx'
+        keyframes, traj, traj_meta = run_demo_episode(env, base_cameras + ['wrist'], record_trajectory=want_traj)
+
+        if want_traj:
+            rollout_path = pathlib.Path(FLAGS.rollout_path)
+            rollout_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                rollout_path,
+                **{k: np.asarray(v) for k, v in traj.items()},
+                env_name=FLAGS.env_name,
+                seed=FLAGS.seed,
+                resolution=FLAGS.resolution,
+                lighting=json.dumps(env.unwrapped.render_lighting),
+                grasp_step=traj_meta['grasp_step'],
+            )
+            print(f'Wrote rollout {rollout_path} ({traj_meta})', flush=True)
 
         for moment, frames in keyframes.items():
             row = all_rows.setdefault(moment, {})
@@ -231,6 +315,7 @@ def main(_):
                 name = variant if cam == 'wrist' else cam
                 Image.fromarray(frame).save(save_dir / f'{moment}__{name}.png')
 
+        lighting_used = env.unwrapped.render_lighting
         env.close()
 
     camera_order = base_cameras + list(WRIST_VARIANTS.keys())
@@ -242,6 +327,8 @@ def main(_):
         resolution=FLAGS.resolution,
         num_stat_resets=FLAGS.num_stat_resets,
         seed=FLAGS.seed,
+        lighting_enabled=FLAGS.lighting,
+        lighting=lighting_used,
         cameras=stats,
     )
     (save_dir / 'camera_stats.json').write_text(json.dumps(stats_out, indent=2))

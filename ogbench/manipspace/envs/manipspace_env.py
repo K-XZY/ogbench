@@ -32,6 +32,31 @@ DEFAULT_OVERHEAD_CAMERA = dict(
     fovy=60.0,
 )
 
+# Optional extra lighting for the VLA render path.
+#
+# Upstream is dim -- `front` averages ~46/255, about 18% of range, where natural photographs a
+# pretrained encoder was trained on sit nearer 45-50%. Note that the light-removal loop in
+# `build_mjcf_model` only strips lights from the *UR5e* MJCF (a single spotlight targeting
+# `wrist_2_link`); the arena keeps its `global` directional light and its `spotlight`. So this is
+# not restoring deleted lights, it is adding exposure on top of what already exists.
+#
+# `ambient` does the heavy lifting: it lifts shadowed regions, where the detail is lost, without
+# pushing already-lit metal toward clipping. The added area light over the workspace fills the
+# table. `castshadow` stays off so we do not introduce a second shadow that conflicts with the
+# existing ones.
+DEFAULT_RENDER_LIGHTING = dict(
+    headlight_diffuse=0.8,
+    headlight_ambient=0.35,
+    workspace_light=dict(
+        pos=(0.425, 0.0, 1.0),
+        dir=(0.0, 0.0, -1.0),
+        diffuse=(0.4, 0.4, 0.4),
+        specular=(0.0, 0.0, 0.0),
+        cutoff=70.0,
+        castshadow=False,
+    ),
+)
+
 # Friendly camera names -> MJCF identifiers. The dataset records `front`/`overhead`/`wrist`; the
 # wrist camera is mounted inside the gripper's attachment namespace, so its compiled name is
 # prefixed, and OGBench's pixel camera is called `front_pixels`.
@@ -72,6 +97,7 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         wrist_camera=None,
         overhead_camera=None,
         visual_znear=None,
+        render_lighting=None,
         reward_task_id=None,
         use_oracle_rep=False,
         **kwargs,
@@ -101,6 +127,9 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
                 `DEFAULT_OVERHEAD_CAMERA`.
             visual_znear: Near clipping plane as a fraction of `statistic.extent`. None keeps the upstream 0.1;
                 the wrist camera needs `DEFAULT_RENDER_ZNEAR`.
+            render_lighting: Extra lighting for the render path. None keeps upstream lighting; True uses
+                `DEFAULT_RENDER_LIGHTING`; a dict overrides its individual entries. Recorded in the dataset config,
+                since it changes what every frame looks like.
             reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a single-task
             mode with the specified task ID. The task ID must be either a valid task ID or 0, where 0 means using the
             default task.
@@ -167,6 +196,13 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             self._overhead_camera = dict(DEFAULT_OVERHEAD_CAMERA)
         else:
             self._overhead_camera = {**DEFAULT_OVERHEAD_CAMERA, **overhead_camera}
+
+        if render_lighting is None or render_lighting is False:
+            self._render_lighting = None
+        elif render_lighting is True:
+            self._render_lighting = dict(DEFAULT_RENDER_LIGHTING)
+        else:
+            self._render_lighting = {**DEFAULT_RENDER_LIGHTING, **render_lighting}
 
         self._visual_znear = visual_znear
         self._render_camera_names = None if render_camera_names is None else list(render_camera_names)
@@ -277,6 +313,21 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         # Attach UR5e to the scene.
         mjcf_utils.attach(arena_mjcf, ur5e_mjcf)
+
+        if self._render_lighting is not None:
+            lighting = dict(self._render_lighting)
+            workspace_light = lighting.pop('workspace_light', None)
+            headlight_diffuse = lighting.pop('headlight_diffuse', None)
+            headlight_ambient = lighting.pop('headlight_ambient', None)
+            if lighting:
+                raise ValueError(f'Unknown render_lighting keys: {sorted(lighting)}')
+
+            if headlight_diffuse is not None:
+                arena_mjcf.visual.headlight.diffuse = (headlight_diffuse,) * 3
+            if headlight_ambient is not None:
+                arena_mjcf.visual.headlight.ambient = (headlight_ambient,) * 3
+            if workspace_light is not None:
+                arena_mjcf.worldbody.add('light', name='workspace', **workspace_light)
 
         if self._overhead_camera is not None:
             arena_mjcf.worldbody.add('camera', name='overhead', **self._overhead_camera)
@@ -618,6 +669,11 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             camera = 'front' if self._ob_type == 'states' else 'front_pixels'
 
         return super().render(camera=camera, *args, **kwargs)
+
+    @property
+    def render_lighting(self):
+        """The lighting configuration in effect, or None for upstream lighting. Record this in the dataset."""
+        return None if self._render_lighting is None else dict(self._render_lighting)
 
     @staticmethod
     def resolve_camera_name(name):
