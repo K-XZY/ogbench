@@ -143,7 +143,7 @@ def project(model, data, cam_id, points, height, width):
 
 
 def workspace_frame_fraction(env, frames):
-    """Fraction of each frame spanned by the object sampling volume.
+    """Framing and exposure of the object sampling volume in each frame.
 
     The axis-aligned pixel bounding box of the eight corners of the sampling volume, clipped to the
     frame, over total image area. This is the number behind "the workspace fills a third of the
@@ -154,19 +154,26 @@ def workspace_frame_fraction(env, frames):
     (x_lo, y_lo), (x_hi, y_hi) = unwrapped._object_sampling_bounds
     corners = [(x, y, z) for x in (x_lo, x_hi) for y in (y_lo, y_hi) for z in (0.02, 0.10)]
 
-    fractions = {}
+    out = {}
     for name, frame in frames.items():
         height, width = frame.shape[:2]
         cam_id = model.camera(ManipSpaceEnv.resolve_camera_name(name)).id
         pts = project(model, data, cam_id, corners, height, width)
         if not pts:
-            fractions[name] = 0.0
+            out[name] = dict(fraction=0.0, mean_brightness=0.0)
             continue
         xs, ys = zip(*pts)
-        box_w = max(0.0, min(max(xs), width) - max(min(xs), 0.0))
-        box_h = max(0.0, min(max(ys), height) - max(min(ys), 0.0))
-        fractions[name] = float(box_w * box_h / (width * height))
-    return fractions
+        x0, x1 = int(max(min(xs), 0.0)), int(min(max(xs), width))
+        y0, y1 = int(max(min(ys), 0.0)), int(min(max(ys), height))
+        box_w, box_h = max(0, x1 - x0), max(0, y1 - y0)
+        # Exposure inside the workspace is the number that matters: a whole-frame mean is dominated
+        # by floor and skybox that carry no task information and are dark by design.
+        crop = frame[y0:y1, x0:x1]
+        out[name] = dict(
+            fraction=float(box_w * box_h / (width * height)),
+            mean_brightness=float(crop.mean()) if crop.size else 0.0,
+        )
+    return out
 
 
 def cube_pixel_coverage(env, frames):
@@ -194,7 +201,10 @@ def cube_pixel_coverage(env, frames):
 def collect_stats(env, camera_names, num_resets):
     """Measure cube visibility and brightness across resets."""
     per_camera = {
-        name: dict(visible_counts=[], mean_full=[], mean_center=[], workspace_frac=[], clipped=[], cube_sat=[])
+        name: dict(
+            visible_counts=[], mean_full=[], mean_center=[], workspace_frac=[], workspace_bright=[],
+            clipped=[], cube_sat=[],
+        )
         for name in camera_names
     }
 
@@ -213,7 +223,8 @@ def collect_stats(env, camera_names, num_resets):
             # A whole-frame mean is dominated by dark floor and skybox when the workspace is small in
             # frame, so report the centre crop too before concluding anything about lighting.
             per_camera[name]['mean_center'].append(float(center.mean()))
-            per_camera[name]['workspace_frac'].append(workspace[name])
+            per_camera[name]['workspace_frac'].append(workspace[name]['fraction'])
+            per_camera[name]['workspace_bright'].append(workspace[name]['mean_brightness'])
             per_camera[name]['clipped'].append(fidelity[name]['frac_clipped'])
             per_camera[name]['cube_sat'].append(fidelity[name]['mean_cube_saturation'])
 
@@ -230,6 +241,7 @@ def collect_stats(env, camera_names, num_resets):
             mean_brightness_center=float(np.mean(rec['mean_center'])),
             std_brightness_full=float(np.std(rec['mean_full'])),
             mean_workspace_frame_fraction=float(np.mean(rec['workspace_frac'])),
+            mean_workspace_brightness=float(np.mean(rec['workspace_bright'])),
             frac_pixels_clipped=float(np.mean(rec['clipped'])),
             mean_cube_saturation=float(np.mean(rec['cube_sat'])),
         )
