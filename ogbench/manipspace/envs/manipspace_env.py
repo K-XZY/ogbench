@@ -10,6 +10,34 @@ from ogbench.manipspace import controllers, lie, mjcf_utils
 from ogbench.manipspace.envs.env import CustomMuJoCoEnv
 
 
+# Default pose of the optional `wrist` camera, expressed in the Robotiq 2F85 `base` frame.
+# In that frame +z is the gripper approach axis (the `pinch` site sits at (0, 0, 0.145)) and the
+# fingers open along +-y. The camera sits behind and to the side of the pinch and looks at it, so
+# the fingers land left/right in the image and a grasped cube is centered. Keep these as config
+# values: they are derived from the MJCF geometry and are expected to be tuned from a render.
+DEFAULT_WRIST_CAMERA = dict(
+    pos=(-0.06, 0.0, 0.03),
+    xyaxes=(0.0, 1.0, 0.0, 0.8866, 0.0, -0.4626),
+    fovy=65.0,
+)
+
+# Default pose of the optional `overhead` camera, in world coordinates. Top-down over the workspace
+# centre, looking straight down (-z). Image-right is world +y, matching the `front` cameras, so
+# image-up is world -x, i.e. toward the robot base. At 0.68 m above the table fovy=60 covers roughly
+# y in [-0.39, 0.39] and x in [0.03, 0.82], which holds the object sampling bounds with margin.
+# Config values, not literals: expected to be tuned from a render.
+DEFAULT_OVERHEAD_CAMERA = dict(
+    pos=(0.425, 0.0, 0.7),
+    xyaxes=(0.0, 1.0, 0.0, -1.0, 0.0, 0.0),
+    fovy=60.0,
+)
+
+# `visual/map znear` is a *fraction of* `statistic.extent`, so the upstream 0.1 with extent 0.7
+# puts the near plane at 0.07 m -- which would slice off the proximal half of the fingers in the
+# wrist view. 0.02 puts it at 0.014 m. Only depth precision suffers, and we render RGB only.
+DEFAULT_RENDER_ZNEAR = 0.02
+
+
 class ManipSpaceEnv(CustomMuJoCoEnv):
     """ManipSpace environment.
 
@@ -30,6 +58,11 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         mode='task',
         visualize_info=True,
         pixel_transparent_arm=True,
+        pixel_recolor_arm=True,
+        render_camera_names=None,
+        wrist_camera=None,
+        overhead_camera=None,
+        visual_znear=None,
         reward_task_id=None,
         use_oracle_rep=False,
         **kwargs,
@@ -48,6 +81,17 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
                 data.
             visualize_info: Whether to visualize the task information (e.g., success status).
             pixel_transparent_arm: Whether to make the arm transparent in pixel-based observations.
+            pixel_recolor_arm: Whether to recolor the gripper purple in pixel-based observations. Set to False for
+                realistic appearance.
+            render_camera_names: If not None, a list of camera names that `render_cameras` renders, enabling the
+                multi-camera render path. Because that path exists to produce training observations, it refuses to
+                run with `visualize_info=True`, which would paint the goal into the image.
+            wrist_camera: Wrist camera configuration. None disables it (upstream behavior); True uses
+                `DEFAULT_WRIST_CAMERA`; a dict overrides individual `pos`/`xyaxes`/`fovy` entries of that default.
+            overhead_camera: Overhead camera configuration, same convention as `wrist_camera` but relative to
+                `DEFAULT_OVERHEAD_CAMERA`.
+            visual_znear: Near clipping plane as a fraction of `statistic.extent`. None keeps the upstream 0.1;
+                the wrist camera needs `DEFAULT_RENDER_ZNEAR`.
             reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a single-task
             mode with the specified task ID. The task ID must be either a valid task ID or 0, where 0 means using the
             default task.
@@ -96,11 +140,40 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         self._mode = mode
         self._visualize_info = visualize_info
         self._pixel_transparent_arm = pixel_transparent_arm
+        self._pixel_recolor_arm = pixel_recolor_arm
         self._reward_task_id = reward_task_id
         self._use_oracle_rep = use_oracle_rep
 
+        # Wrist camera configuration.
+        if wrist_camera is None or wrist_camera is False:
+            self._wrist_camera = None
+        elif wrist_camera is True:
+            self._wrist_camera = dict(DEFAULT_WRIST_CAMERA)
+        else:
+            self._wrist_camera = {**DEFAULT_WRIST_CAMERA, **wrist_camera}
+
+        if overhead_camera is None or overhead_camera is False:
+            self._overhead_camera = None
+        elif overhead_camera is True:
+            self._overhead_camera = dict(DEFAULT_OVERHEAD_CAMERA)
+        else:
+            self._overhead_camera = {**DEFAULT_OVERHEAD_CAMERA, **overhead_camera}
+
+        self._visual_znear = visual_znear
+        self._render_camera_names = None if render_camera_names is None else list(render_camera_names)
+
+        # Segment bookkeeping for data collection. A segment begins at every `set_new_target` call.
+        self._segment_index = -1
+        self._segment_step = 0
+
         assert ob_type in ['states', 'pixels']
         assert success_timing in ['pre', 'post']
+        if self._render_camera_names is not None and visualize_info:
+            # `visualize_info` draws the target cube as a translucent ghost and recolors cubes on success, both of
+            # which put goal and reward information directly into the pixels. Never render training data with it on.
+            raise ValueError(
+                'render_camera_names requires visualize_info=False; otherwise the goal leaks into the image.'
+            )
 
         # Initialize inverse kinematics controller.
         ik_mjcf = mjcf.from_path((self._desc_dir / 'universal_robots_ur5e' / 'ur5e.xml'), escape_separators=True)
@@ -172,7 +245,7 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         getattr(arena_mjcf.visual, 'global').elevation = -20
         getattr(arena_mjcf.visual, 'global').azimuth = 180
         arena_mjcf.statistic.meansize = 0.04
-        arena_mjcf.visual.map.znear = 0.1
+        arena_mjcf.visual.map.znear = 0.1 if self._visual_znear is None else self._visual_znear
         arena_mjcf.visual.map.zfar = 10.0
 
         # Add UR5e robot arm.
@@ -186,10 +259,18 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         # Attach the robotiq gripper to the UR5e flange.
         gripper_mjcf = mjcf.from_path((self._desc_dir / 'robotiq_2f85' / '2f85.xml'), escape_separators=True)
         gripper_mjcf.model = 'robotiq'
+
+        if self._wrist_camera is not None:
+            # Mount on the gripper `base` body, so the camera moves with the hand.
+            gripper_mjcf.find('body', 'base').add('camera', name='wrist', **self._wrist_camera)
+
         mjcf_utils.attach(ur5e_mjcf, gripper_mjcf, 'attachment_site')
 
         # Attach UR5e to the scene.
         mjcf_utils.attach(arena_mjcf, ur5e_mjcf)
+
+        if self._overhead_camera is not None:
+            arena_mjcf.worldbody.add('camera', name='overhead', **self._overhead_camera)
 
         self.add_objects(arena_mjcf)
 
@@ -209,8 +290,9 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         if self._ob_type == 'pixels':
             # Adjust colors for pixel-based tasks.
-            arena_mjcf.find('material', 'ur5e/robotiq/black').rgba = self._colors['purple']
-            arena_mjcf.find('material', 'ur5e/robotiq/pad_gray').rgba = self._colors['purple']
+            if self._pixel_recolor_arm:
+                arena_mjcf.find('material', 'ur5e/robotiq/black').rgba = self._colors['purple']
+                arena_mjcf.find('material', 'ur5e/robotiq/pad_gray').rgba = self._colors['purple']
             if self._pixel_transparent_arm:
                 arena_mjcf.find('material', 'ur5e/robotiq/metal').rgba[3] = 0.1
                 arena_mjcf.find('material', 'ur5e/robotiq/silicone').rgba[3] = 0.1
@@ -280,6 +362,10 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         pass
 
     def reset(self, options=None, *args, **kwargs):
+        # `super().reset` runs `initialize_episode`, which calls `set_new_target` for the first segment.
+        self._segment_index = -1
+        self._segment_step = 0
+
         if self._mode == 'task':
             # Set the task goal.
             if options is None:
@@ -365,6 +451,20 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
     def set_new_target(self, return_info=True):
         pass
+
+    def begin_new_segment(self):
+        """Mark the start of a new subtask segment.
+
+        Called by every `set_new_target` implementation. `_segment_step` is incremented in `post_step`, so the first
+        step of a segment reports `_segment_step == 1`; that is what `segment_start` keys off. Deriving the flag from
+        a counter rather than mutating state at read time keeps `compute_ob_info` free of side effects, which matters
+        because `pre_step` also calls it.
+        """
+        self._segment_index += 1
+        self._segment_step = 0
+
+    def post_step(self):
+        self._segment_step += 1
 
     def set_control(self, action):
         action = self.unnormalize_action(action)
@@ -509,3 +609,19 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             camera = 'front' if self._ob_type == 'states' else 'front_pixels'
 
         return super().render(camera=camera, *args, **kwargs)
+
+    def render_cameras(self, camera_names=None, *args, **kwargs):
+        """Render one frame per camera at the environment's render resolution.
+
+        Args:
+            camera_names: Cameras to render. Defaults to `render_camera_names` given at construction.
+
+        Returns:
+            A dict mapping camera name to an (height, width, 3) uint8 frame.
+        """
+        if camera_names is None:
+            camera_names = self._render_camera_names
+        if camera_names is None:
+            raise ValueError('No cameras to render; pass render_camera_names to the environment or camera_names here.')
+
+        return {name: self.render(camera=name, *args, **kwargs) for name in camera_names}

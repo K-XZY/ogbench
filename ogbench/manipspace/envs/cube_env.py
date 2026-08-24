@@ -653,6 +653,8 @@ class CubeEnv(ManipSpaceEnv):
         """
         assert self._mode == 'data_collection'
 
+        self.begin_new_segment()
+
         block_xyzs = np.array([self._data.joint(f'object_joint_{i}').qpos[:3] for i in range(self._num_cubes)])
 
         # Compute the top blocks.
@@ -720,6 +722,8 @@ class CubeEnv(ManipSpaceEnv):
         return cube_successes
 
     def post_step(self):
+        super().post_step()
+
         # Check if the cubes are in the target positions.
         cube_successes = self._compute_successes()
         if self._mode == 'data_collection':
@@ -759,9 +763,15 @@ class CubeEnv(ManipSpaceEnv):
             target_mocap_id = self._cube_target_mocap_ids[self._target_block]
             ob_info['privileged/target_block'] = self._target_block
             ob_info['privileged/target_block_pos'] = self._data.mocap_pos[target_mocap_id].copy()
+            ob_info['privileged/target_block_quat'] = self._data.mocap_quat[target_mocap_id].copy()
             ob_info['privileged/target_block_yaw'] = np.array(
                 [lie.SO3(wxyz=self._data.mocap_quat[target_mocap_id]).compute_yaw_radians()]
             )
+
+            # Subtask segment bookkeeping. `set_new_target` starts a segment and zeroes `_segment_step`, which
+            # `post_step` then increments, so the first step of a segment is the one reporting `_segment_step == 1`.
+            ob_info['privileged/segment_index'] = self._segment_index
+            ob_info['privileged/segment_start'] = self._segment_step <= 1
 
     def compute_observation(self):
         if self._ob_type == 'pixels':
