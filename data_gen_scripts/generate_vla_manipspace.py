@@ -18,6 +18,8 @@ Run on the box (nothing here runs on the Mac):
         --save_root=/mnt/data/Work/goal-conditioned-vla/data
 """
 
+import contextlib
+import importlib
 import json
 import pathlib
 import subprocess
@@ -80,6 +82,29 @@ def git_sha(path):
         ).strip()
     except (subprocess.CalledProcessError, OSError):
         return ''
+
+
+def collect_provenance(writer_mod, repo_root, ogbench_root):
+    """The three fields that identify the data: parent SHA, ogbench SHA, MuJoCo version.
+
+    Prefers Lane B's collector, which also refuses a dirty tree. Falls back to reading the SHAs
+    directly while that is still a stub, so `--dry_run` works before the writer lands; the fallback
+    disappears on its own once `Provenance.collect` is implemented.
+    """
+    try:
+        prov = writer_mod.Provenance.collect(str(repo_root))
+        return prov.git_sha_parent, prov.git_sha_ogbench, prov.mujoco_version
+    except NotImplementedError:
+        return git_sha(repo_root), git_sha(ogbench_root), mujoco.__version__
+
+
+def run_config():
+    """The full config, frozen to config.yaml by the writer. Section 3b: every run, no exceptions.
+
+    This module's own flags only -- absl's logging flags are not part of what identifies a run.
+    """
+    own = FLAGS.flags_by_module_dict().get(__file__, [])
+    return {flag.name: flag.value for flag in own}
 
 
 def make_env():
@@ -311,63 +336,74 @@ def main(_):
         raise ValueError('--save_root is required unless --dry_run.')
 
     ogbench_root = pathlib.Path(__file__).resolve().parents[1]
-    GIT_SHA_OGBENCH = git_sha(ogbench_root)
-    GIT_SHA_PARENT = git_sha(ogbench_root.parents[1])
+    repo_root = ogbench_root.parents[1]
+    writer_mod = importlib.import_module(WRITER_MODULE)
+    GIT_SHA_PARENT, GIT_SHA_OGBENCH, mujoco_version = collect_provenance(writer_mod, repo_root, ogbench_root)
 
     np.random.seed(FLAGS.seed)
     env = make_env()
     agents = make_agents(env)
-
-    run_dir = None
-    writer = None
-    if not FLAGS.dry_run:
-        import importlib
-
-        writer = importlib.import_module(WRITER_MODULE)
-        timestamp = time.strftime(schema.TIMESTAMP_FORMAT)
-        run_dir = schema.create_run_dir(FLAGS.save_root, FLAGS.env_name, FLAGS.dataset_type, timestamp)
-        print(f'Run directory: {run_dir}', flush=True)
 
     total_steps = 0
     total_segments = 0
     total_successes = 0
     started = time.time()
 
-    for ep_idx in trange(FLAGS.num_episodes):
-        arrays, meta = collect_episode(env, agents, seed=FLAGS.seed + ep_idx)
+    with contextlib.ExitStack() as stack:
+        run_writer = None
+        if not FLAGS.dry_run:
+            run_writer = stack.enter_context(
+                writer_mod.RunWriter(
+                    FLAGS.save_root,
+                    env_id=FLAGS.env_name,
+                    oracle_type=FLAGS.dataset_type,
+                    config=run_config(),
+                    provenance=writer_mod.Provenance.collect(str(repo_root)),
+                )
+            )
+            print(f'Run directory: {run_writer.run_dir}', flush=True)
 
-        problems = schema.validate_episode(arrays, meta)
-        if problems:
-            raise ValueError(f'episode {ep_idx} does not satisfy the schema:\n  ' + '\n  '.join(problems))
+        for ep_idx in trange(FLAGS.num_episodes):
+            arrays, meta = collect_episode(env, agents, seed=FLAGS.seed + ep_idx)
 
-        total_steps += meta.num_steps
-        total_segments += meta.num_segments
-        total_successes += int(arrays['segment_success'].sum())
+            if run_writer is None:
+                # Writing validates and raises; only the dry run has to check for itself.
+                problems = schema.validate_episode(arrays, meta)
+                if problems:
+                    raise ValueError(
+                        f'episode {ep_idx} does not satisfy the schema:\n  ' + '\n  '.join(problems)
+                    )
+            else:
+                run_writer.write_episode(arrays, meta, index=ep_idx)
+                if ep_idx == 0:
+                    # One reference still per camera, for eyeballing the run later.
+                    for cam in schema.CAMERAS:
+                        run_writer.write_camera_reference(cam, arrays[f'image_{cam}'][0])
 
-        if writer is not None:
-            writer.write_episode(run_dir, ep_idx, arrays, meta)
+            total_steps += meta.num_steps
+            total_segments += meta.num_segments
+            total_successes += int(arrays['segment_success'].sum())
 
-    elapsed = time.time() - started
-    summary = dict(
-        run_name=None if run_dir is None else pathlib.Path(run_dir).name,
-        env_id=FLAGS.env_name,
-        oracle_type=FLAGS.dataset_type,
-        num_episodes=FLAGS.num_episodes,
-        total_steps=total_steps,
-        total_segments=total_segments,
-        segment_success_rate=(total_successes / total_segments) if total_segments else 0.0,
-        mean_steps_per_episode=total_steps / max(FLAGS.num_episodes, 1),
-        wall_time_s=elapsed,
-        schema_version=schema.SCHEMA_VERSION,
-        git_sha_parent=GIT_SHA_PARENT,
-        git_sha_ogbench=GIT_SHA_OGBENCH,
-        mujoco_version=mujoco.__version__,
-        dry_run=FLAGS.dry_run,
-    )
-    print(json.dumps(summary, indent=2), flush=True)
+        summary = dict(
+            env_id=FLAGS.env_name,
+            oracle_type=FLAGS.dataset_type,
+            num_episodes=FLAGS.num_episodes,
+            total_steps=total_steps,
+            total_segments=total_segments,
+            segment_success_rate=(total_successes / total_segments) if total_segments else 0.0,
+            mean_steps_per_episode=total_steps / max(FLAGS.num_episodes, 1),
+            wall_time_s=time.time() - started,
+            schema_version=schema.SCHEMA_VERSION,
+            git_sha_parent=GIT_SHA_PARENT,
+            git_sha_ogbench=GIT_SHA_OGBENCH,
+            mujoco_version=mujoco_version,
+            dry_run=FLAGS.dry_run,
+        )
+        print(json.dumps(summary, indent=2), flush=True)
 
-    if run_dir is not None:
-        (pathlib.Path(run_dir) / 'summary.json').write_text(json.dumps(summary, indent=2))
+        if run_writer is not None:
+            # The writer owns summary.json; these are the generation-side aggregates it cannot know.
+            run_writer.close(extra_summary=summary)
 
 
 if __name__ == '__main__':
