@@ -165,6 +165,7 @@ def read_frame(env, num_cubes):
     info = unwrapped.compute_ob_info()
     images = unwrapped.render_cameras()
 
+    cube_quat = np.stack([info[f'privileged/block_{i}_quat'] for i in range(num_cubes)]).astype(np.float32)
     target_quat = np.asarray(info['privileged/target_block_quat'], dtype=np.float64)
     effector_pos = np.asarray(info['proprio/effector_pos'], dtype=np.float64)
     effector_yaw = float(info['proprio/effector_yaw'][0])
@@ -185,10 +186,14 @@ def read_frame(env, num_cubes):
         qpos=np.asarray(info['qpos'], dtype=np.float64),
         qvel=np.asarray(info['qvel'], dtype=np.float64),
         cube_pos=np.stack([info[f'privileged/block_{i}_pos'] for i in range(num_cubes)]).astype(np.float32),
-        cube_quat=np.stack([info[f'privileged/block_{i}_quat'] for i in range(num_cubes)]).astype(np.float32),
-        cube_yaw=np.array(
-            [info[f'privileged/block_{i}_yaw'][0] for i in range(num_cubes)], dtype=np.float32
-        ),
+        cube_quat=cube_quat,
+        # Derived from the float32 quaternion that is actually stored, not from OGBench's float64
+        # `block_i_yaw`. Same formula, but yaw is genuinely undefined when a cube tips onto an edge:
+        # both arctan2 arguments collapse to ~1e-11, which survives in float64 and rounds to exactly
+        # zero in float32, so the two disagree by radians. Deriving it here makes `cube_yaw` and
+        # `cube_quat` consistent by construction. `cube_quat` remains the trustworthy field for a
+        # tipped cube -- see the note in claude-notes on why yaw alone cannot be.
+        cube_yaw=schema.quat_to_yaw(cube_quat).astype(np.float32),
         target_cube_idx=np.int32(info['privileged/target_block']),
         target_pos=target_pos.astype(np.float32),
         target_quat=target_quat.astype(np.float32),
