@@ -308,6 +308,10 @@ def collect_episode(env, agents, seed):
         image_width=FLAGS.resolution,
         visualize_info=False,
         cube_colors=list(schema.CUBE_COLOR_NAMES[:num_cubes]),
+        # Resolved, read back from the compiled model. The ogbench SHA pins the pose *defaults*, but
+        # any of them can be overridden per env instance and an override leaves no trace in the SHA,
+        # so without this a run made before a camera moved is indistinguishable from one made after.
+        render_config=unwrapped.render_config,
         mujoco_version=mujoco.__version__,
         git_sha_parent=GIT_SHA_PARENT,
         git_sha_ogbench=GIT_SHA_OGBENCH,

@@ -700,6 +700,45 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         return super().render(camera=camera, *args, **kwargs)
 
     @property
+    def render_config(self):
+        """The resolved render configuration, read back from the compiled model.
+
+        Camera poses are read from `MjModel` rather than echoed from the kwargs, so this records what
+        MuJoCo actually built: it covers cameras that are not kwargs at all (`front` is fixed in the
+        env's own MJCF) and collapses every `None`-means-default without a second source of truth.
+
+        `cam_pos`/`cam_quat` are relative to the camera's parent body, so the body name is recorded
+        too -- without it a wrist camera's pose is meaningless.
+        """
+        if self._model is None:
+            raise ValueError('Call `reset` before reading render_config.')
+
+        cameras = {}
+        for name in self._render_camera_names or []:
+            mjcf_name = self.resolve_camera_name(name)
+            cam_id = self._model.camera(mjcf_name).id
+            body_id = int(self._model.cam_bodyid[cam_id])
+            cameras[name] = dict(
+                mjcf_name=mjcf_name,
+                parent_body=self._model.body(body_id).name,
+                pos=self._model.cam_pos[cam_id].tolist(),
+                quat=self._model.cam_quat[cam_id].tolist(),
+                fovy=float(self._model.cam_fovy[cam_id]),
+            )
+
+        return dict(
+            cameras=cameras,
+            image_height=self._render_height,
+            image_width=self._render_width,
+            lighting=self.render_lighting,
+            visual_znear=float(self._mjcf_model.visual.map.znear),
+            statistic_extent=float(self._mjcf_model.statistic.extent),
+            visualize_info=self._visualize_info,
+            pixel_recolor_arm=self._pixel_recolor_arm,
+            pixel_transparent_arm=self._pixel_transparent_arm,
+        )
+
+    @property
     def render_lighting(self):
         """The lighting configuration in effect, or None for upstream lighting. Record this in the dataset."""
         return None if self._render_lighting is None else dict(self._render_lighting)
