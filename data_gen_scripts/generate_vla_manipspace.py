@@ -206,6 +206,21 @@ def read_frame(env, num_cubes):
         ),
         segment_idx=np.int32(info['privileged/segment_index']),
     )
+
+    # How well-conditioned each cube's yaw is: the magnitude of the vector whose angle `quat_to_yaw`
+    # takes. 1 is an upright cube, 0 is a cube tipped onto an edge where yaw has no meaning and the
+    # arctan2 returns an arbitrary value. Stored as the raw magnitude rather than a boolean so no
+    # downstream user inherits a threshold we picked; derive the flag from it.
+    #
+    # Emitted only when the frozen schema knows the field, since `validate_episode` rejects unknown
+    # fields -- so this works either side of the schema landing, without a second edit here.
+    if 'cube_yaw_conditioning' in schema.FIELDS_BY_NAME:
+        q = cube_quat.astype(np.float64)
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        row['cube_yaw_conditioning'] = np.hypot(
+            2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)
+        ).astype(np.float32)
+
     return row
 
 
