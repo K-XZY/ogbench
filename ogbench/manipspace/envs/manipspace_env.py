@@ -32,6 +32,15 @@ DEFAULT_OVERHEAD_CAMERA = dict(
     fovy=60.0,
 )
 
+# Friendly camera names -> MJCF identifiers. The dataset records `front`/`overhead`/`wrist`; the
+# wrist camera is mounted inside the gripper's attachment namespace, so its compiled name is
+# prefixed, and OGBench's pixel camera is called `front_pixels`.
+CAMERA_ALIASES = {
+    'front': 'front_pixels',
+    'overhead': 'overhead',
+    'wrist': 'ur5e/robotiq/wrist',
+}
+
 # `visual/map znear` is a *fraction of* `statistic.extent`, so the upstream 0.1 with extent 0.7
 # puts the near plane at 0.07 m -- which would slice off the proximal half of the fingers in the
 # wrist view. 0.02 puts it at 0.014 m. Only depth precision suffers, and we render RGB only.
@@ -610,18 +619,24 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         return super().render(camera=camera, *args, **kwargs)
 
+    @staticmethod
+    def resolve_camera_name(name):
+        """Map a friendly camera name onto its compiled MJCF identifier, passing through unknown names."""
+        return CAMERA_ALIASES.get(name, name)
+
     def render_cameras(self, camera_names=None, *args, **kwargs):
         """Render one frame per camera at the environment's render resolution.
 
         Args:
-            camera_names: Cameras to render. Defaults to `render_camera_names` given at construction.
+            camera_names: Cameras to render, as friendly names (see `CAMERA_ALIASES`). Defaults to
+                `render_camera_names` given at construction.
 
         Returns:
-            A dict mapping camera name to an (height, width, 3) uint8 frame.
+            A dict keyed by the friendly camera name, with (height, width, 3) uint8 frames.
         """
         if camera_names is None:
             camera_names = self._render_camera_names
         if camera_names is None:
             raise ValueError('No cameras to render; pass render_camera_names to the environment or camera_names here.')
 
-        return {name: self.render(camera=name, *args, **kwargs) for name in camera_names}
+        return {name: self.render(camera=self.resolve_camera_name(name), *args, **kwargs) for name in camera_names}
