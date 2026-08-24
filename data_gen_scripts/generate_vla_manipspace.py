@@ -107,8 +107,10 @@ def make_env():
         width=FLAGS.resolution,
         height=FLAGS.resolution,
         render_camera_names=list(schema.CAMERAS),
-        wrist_camera=True,
-        overhead_camera=True,
+        # Driven off the schema rather than hardcoded, so the camera set follows the frozen contract
+        # instead of needing a second edit whenever it changes.
+        wrist_camera='wrist' in schema.CAMERAS,
+        overhead_camera='overhead' in schema.CAMERAS,
         visual_znear=DEFAULT_RENDER_ZNEAR,
         render_lighting=True if FLAGS.lighting else None,
         pixel_recolor_arm=False,
