@@ -217,9 +217,11 @@ def read_frame(env, num_cubes):
     if 'cube_yaw_conditioning' in schema.FIELDS_BY_NAME:
         q = cube_quat.astype(np.float64)
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        row['cube_yaw_conditioning'] = np.hypot(
-            2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)
-        ).astype(np.float32)
+        conditioning = np.hypot(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)).astype(np.float32)
+        row['cube_yaw_conditioning'] = conditioning
+        # Threshold taken from the schema, never restated here: the validator checks the flag against
+        # its own epsilon applied to the stored conditioning, so a local copy could only ever drift.
+        row['cube_yaw_degenerate'] = conditioning < schema.YAW_DEGENERACY_EPS
 
     return row
 
