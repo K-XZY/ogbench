@@ -235,7 +235,9 @@ def collect_episode(env, agents, seed):
     num_steps = len(actions)
     arrays = {}
     for spec in schema.EPISODE_FIELDS:
-        if spec.axis != schema.FRAME:
+        # `segment_start` is a frame field but is derived from `segment_idx` below rather than read
+        # per frame, so it is not present in the rows.
+        if spec.axis != schema.FRAME or spec.name == 'segment_start':
             continue
         arrays[spec.name] = np.stack([f[spec.name] for f in frames]).astype(spec.dtype)
 
