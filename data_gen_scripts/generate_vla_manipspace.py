@@ -19,6 +19,8 @@ Run on the box (nothing here runs on the Mac):
 """
 
 import contextlib
+import dataclasses
+import hashlib
 import importlib
 import json
 import pathlib
@@ -90,6 +92,37 @@ def _schema():
 
 
 schema = _schema()
+
+
+def code_hashes():
+    """sha256 prefixes of the files that shape the record: schema, writer and this generator.
+
+    Hashes file *bytes*, so it is reproducible without importing anything.
+
+    The point is cross-run comparability, not dirtiness -- `Provenance.collect` already refuses an
+    uncommitted tree on both repos. Two runs can carry different `git_sha_parent` and identical
+    generation code, which is exactly what happened across the two halves of this dataset; a content
+    hash settles that from the data instead of from a note. All three files are included because
+    half a pipeline pinned is not comparability.
+    """
+    here = pathlib.Path(__file__).resolve()
+    repo = here.parents[3]
+    paths = {
+        'schema.py': repo / 'src' / 'goal_conditioned_vla' / 'data' / 'schema.py',
+        'writer.py': repo / 'src' / 'goal_conditioned_vla' / 'data' / 'writer.py',
+        'generate_vla_manipspace.py': here,
+    }
+    return {name: hashlib.sha256(path.read_bytes()).hexdigest()[:16] for name, path in paths.items()}
+
+
+def meta_supports(field_name):
+    """Whether the frozen `EpisodeMeta` declares a field.
+
+    `EpisodeMeta` is a dataclass, so passing a field it does not declare raises. Guarding lets this
+    populate a field the moment the schema adopts it, without a second edit here and without
+    breaking against the schema that predates it.
+    """
+    return field_name in {f.name for f in dataclasses.fields(schema.EpisodeMeta)}
 
 
 def collect_provenance(writer_mod, repo_root):
@@ -408,11 +441,15 @@ def collect_episode(env, agents, seed, ep_idx):
         control_timestep=float(unwrapped._control_timestep),
         physics_timestep=float(unwrapped._physics_timestep),
     )
+    if meta_supports('code_hash'):
+        meta.code_hash = CODE_HASHES
     return arrays, meta
 
 
 GIT_SHA_PARENT = ''
 GIT_SHA_OGBENCH = ''
+# Computed once per run: the files cannot change under a running process in any way that matters.
+CODE_HASHES = {}
 
 
 def main(_):
@@ -426,6 +463,8 @@ def main(_):
     ogbench_root = pathlib.Path(__file__).resolve().parents[1]
     repo_root = ogbench_root.parents[1]
     writer_mod = importlib.import_module(WRITER_MODULE)
+    global CODE_HASHES
+    CODE_HASHES = code_hashes()
     provenance = collect_provenance(writer_mod, repo_root)
     GIT_SHA_PARENT = provenance.git_sha_parent
     GIT_SHA_OGBENCH = provenance.git_sha_ogbench
