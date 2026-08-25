@@ -195,7 +195,13 @@ def read_frame(env, num_cubes):
     info = unwrapped.compute_ob_info()
     images = unwrapped.render_cameras()
 
-    cube_quat = np.stack([info[f'privileged/block_{i}_quat'] for i in range(num_cubes)]).astype(np.float32)
+    # Cast to the *stored* precision here, deliberately: `cube_yaw` and `cube_yaw_conditioning` are
+    # derived from this array below, and the validator recomputes them from the stored quaternion.
+    # Deriving them at a higher precision than is written would reintroduce the disagreement this
+    # was built to remove. Schema-driven so it follows the contract rather than a literal.
+    cube_quat = np.stack([info[f'privileged/block_{i}_quat'] for i in range(num_cubes)]).astype(
+        schema.FIELDS_BY_NAME['cube_quat'].dtype
+    )
     target_quat = np.asarray(info['privileged/target_block_quat'], dtype=np.float64)
     effector_pos = np.asarray(info['proprio/effector_pos'], dtype=np.float64)
     effector_yaw = float(info['proprio/effector_yaw'][0])
@@ -203,19 +209,19 @@ def read_frame(env, num_cubes):
 
     row = {f'image_{cam}': images[cam] for cam in schema.CAMERAS}
     row.update(
-        joint_pos=np.asarray(info['proprio/joint_pos'], dtype=np.float32),
-        joint_vel=np.asarray(info['proprio/joint_vel'], dtype=np.float32),
+        joint_pos=np.asarray(info['proprio/joint_pos'], dtype=np.float64),
+        joint_vel=np.asarray(info['proprio/joint_vel'], dtype=np.float64),
         # The normalized `gripper_opening` is also recorded; this is the raw driver joint behind it.
-        gripper_joint_pos=np.float32(unwrapped._data.qpos[unwrapped._gripper_opening_joint_id]),
-        gripper_joint_vel=np.float32(info['proprio/gripper_vel'][0]),
-        effector_pos=effector_pos.astype(np.float32),
-        effector_yaw=np.float32(effector_yaw),
-        gripper_opening=np.float32(info['proprio/gripper_opening'][0]),
-        gripper_contact=np.float32(info['proprio/gripper_contact'][0]),
+        gripper_joint_pos=np.float64(unwrapped._data.qpos[unwrapped._gripper_opening_joint_id]),
+        gripper_joint_vel=np.float64(info['proprio/gripper_vel'][0]),
+        effector_pos=effector_pos,
+        effector_yaw=np.float64(effector_yaw),
+        gripper_opening=np.float64(info['proprio/gripper_opening'][0]),
+        gripper_contact=np.float64(info['proprio/gripper_contact'][0]),
         # float64 verbatim: downcasting these would break the exact-replay guarantee they exist for.
         qpos=np.asarray(info['qpos'], dtype=np.float64),
         qvel=np.asarray(info['qvel'], dtype=np.float64),
-        cube_pos=np.stack([info[f'privileged/block_{i}_pos'] for i in range(num_cubes)]).astype(np.float32),
+        cube_pos=np.stack([info[f'privileged/block_{i}_pos'] for i in range(num_cubes)]),
         cube_quat=cube_quat,
         # Derived from the float32 quaternion that is actually stored, not from OGBench's float64
         # `block_i_yaw`. Same formula, but yaw is genuinely undefined when a cube tips onto an edge:
@@ -223,17 +229,23 @@ def read_frame(env, num_cubes):
         # zero in float32, so the two disagree by radians. Deriving it here makes `cube_yaw` and
         # `cube_quat` consistent by construction. `cube_quat` remains the trustworthy field for a
         # tipped cube -- see the note in claude-notes on why yaw alone cannot be.
-        cube_yaw=schema.quat_to_yaw(cube_quat).astype(np.float32),
+        cube_yaw=schema.quat_to_yaw(cube_quat),
         target_cube_idx=np.int32(info['privileged/target_block']),
-        target_pos=target_pos.astype(np.float32),
-        target_quat=target_quat.astype(np.float32),
+        target_pos=target_pos,
+        target_quat=target_quat,
         # World axes, not rotated into the EE frame. See the schema module docstring.
-        target_pos_rel_ee=(target_pos - effector_pos).astype(np.float32),
-        target_yaw_rel_ee=np.float32(
+        target_pos_rel_ee=(target_pos - effector_pos),
+        target_yaw_rel_ee=np.float64(
             schema.wrap_to_pi(schema.quat_to_yaw(target_quat) - effector_yaw)
         ),
         segment_idx=np.int32(info['privileged/segment_index']),
     )
+
+    if 'qacc_warmstart' in schema.FIELDS_BY_NAME:
+        # The constraint solver's initial guess. `set_state` restores qpos/qvel but not this, which
+        # is why a mid-episode restore reproduced the control exactly and the resulting state did
+        # not. Captured after the step, so it is what the *next* step will warm-start from.
+        row['qacc_warmstart'] = unwrapped._data.qacc_warmstart.copy()
 
     # How well-conditioned each cube's yaw is: the magnitude of the vector whose angle `quat_to_yaw`
     # takes. 1 is an upright cube, 0 is a cube tipped onto an edge where yaw has no meaning and the
@@ -245,7 +257,7 @@ def read_frame(env, num_cubes):
     if 'cube_yaw_conditioning' in schema.FIELDS_BY_NAME:
         q = cube_quat.astype(np.float64)
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        conditioning = np.hypot(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)).astype(np.float32)
+        conditioning = np.hypot(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
         row['cube_yaw_conditioning'] = conditioning
         # Threshold taken from the schema, never restated here: the validator checks the flag against
         # its own epsilon applied to the stored conditioning, so a local copy could only ever drift.
@@ -305,9 +317,14 @@ def collect_episode(env, agents, seed):
             continue
         arrays[spec.name] = np.stack([f[spec.name] for f in frames]).astype(spec.dtype)
 
+    # Dtypes come from the schema, never from a literal here. Actions were stored float32 once, and
+    # the ~1e-07 rounding that introduced amplified through contact dynamics into replay divergence
+    # of up to 1.33 m -- the difference between "enables exact replay" being true and aspirational.
     action_norm = np.asarray(actions, dtype=np.float64).reshape(num_steps, schema.ACTION_DIM)
-    arrays['action_norm'] = action_norm.astype(np.float32)
-    arrays['action_raw'] = (action_norm * schema.ACTION_SCALE).astype(np.float32)
+    arrays['action_norm'] = action_norm.astype(schema.FIELDS_BY_NAME['action_norm'].dtype)
+    arrays['action_raw'] = (action_norm * schema.ACTION_SCALE).astype(
+        schema.FIELDS_BY_NAME['action_raw'].dtype
+    )
 
     # segment_start is derived from segment_idx rather than read from the env, so it cannot disagree
     # with it -- which is exactly the invariant the validator checks.
