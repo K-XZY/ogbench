@@ -50,6 +50,11 @@ flags.DEFINE_float('noise_smoothing', 0.5, 'Action noise smoothing for the plan 
 flags.DEFINE_float('min_norm', 0.4, 'Minimum action norm for the Markov oracle.')
 flags.DEFINE_float('p_random_action', 0.0, 'Probability of a random action (noisy only).')
 flags.DEFINE_bool('lighting', True, 'Enable the extra render lighting.')
+flags.DEFINE_bool(
+    'consistent_kinematics', False,
+    'Recompute forward kinematics before reading them in set_control. Makes mid-episode resets exact, '
+    'at the cost of dynamics that differ from upstream OGBench. Frozen into config.yaml either way.'
+)
 flags.DEFINE_bool('dry_run', False, 'Assemble and validate episodes without writing them.')
 
 # Lane B owns the shard writer (plan section 5). Import it lazily so --dry_run works before it lands.
@@ -113,6 +118,7 @@ def make_env():
         overhead_camera='overhead' in schema.CAMERAS,
         visual_znear=DEFAULT_RENDER_ZNEAR,
         render_lighting=True if FLAGS.lighting else None,
+        consistent_kinematics=FLAGS.consistent_kinematics,
         pixel_recolor_arm=False,
         pixel_transparent_arm=False,
     )

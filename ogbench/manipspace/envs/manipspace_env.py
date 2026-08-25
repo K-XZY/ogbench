@@ -136,6 +136,7 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         overhead_camera=None,
         visual_znear=None,
         render_lighting=None,
+        consistent_kinematics=False,
         reward_task_id=None,
         use_oracle_rep=False,
         **kwargs,
@@ -168,6 +169,8 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             render_lighting: Extra lighting for the render path. None keeps upstream lighting; True uses
                 `DEFAULT_RENDER_LIGHTING`; a dict overrides its individual entries. Recorded in the dataset config,
                 since it changes what every frame looks like.
+            consistent_kinematics: Recompute forward kinematics before reading them in `set_control`. Off by
+                default, because it changes the dynamics -- see `set_control` for why it exists and what it costs.
             reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a single-task
             mode with the specified task ID. The task ID must be either a valid task ID or 0, where 0 means using the
             default task.
@@ -242,6 +245,7 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         else:
             self._render_lighting = {**DEFAULT_RENDER_LIGHTING, **render_lighting}
 
+        self._consistent_kinematics = consistent_kinematics
         self._visual_znear = visual_znear
         self._render_camera_names = None if render_camera_names is None else list(render_camera_names)
 
@@ -565,6 +569,23 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         self._segment_step += 1
 
     def set_control(self, action):
+        if self._consistent_kinematics:
+            # `mj_step` runs its forward pass at the current state and *then* integrates, so on return
+            # `qpos` is the new configuration while `site_xpos` still reflects the previous one. With
+            # `nstep=25` per control step the lag is one physics substep -- a configuration that never
+            # appears at control-step granularity and so cannot be recovered from any recorded frame.
+            #
+            # During a forward rollout that staleness is self-consistent: every step reads kinematics
+            # lagged the same way, which is just a small effective control delay. It only bites on
+            # *restore*, where the lag is not in the recorded state, leaving `qpos`/`qvel` insufficient
+            # to reproduce the control. Recomputing here makes them sufficient: a mid-episode
+            # `set_state` then reproduces the control bit-identically.
+            #
+            # Off by default because it changes the dynamics relative to upstream OGBench, whose
+            # published numbers are a reference point. Turn it on for data that must support exact
+            # mid-episode resets, and record that it was on.
+            mujoco.mj_forward(self._model, self._data)
+
         action = self.unnormalize_action(action)
         a_pos, a_ori, a_gripper = action[:3], action[3], action[4]
 
@@ -737,6 +758,9 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         return dict(
             cameras=cameras,
+            # Not a render setting, but it changes the trajectories a run contains, so it belongs with
+            # whatever identifies the data. See `set_control`.
+            consistent_kinematics=self._consistent_kinematics,
             image_height=self._render_height,
             image_width=self._render_width,
             lighting=self.render_lighting,
@@ -810,6 +834,7 @@ def render_config_to_kwargs(render_config):
         'visualize_info': render_config['visualize_info'],
         'pixel_recolor_arm': render_config['pixel_recolor_arm'],
         'pixel_transparent_arm': render_config['pixel_transparent_arm'],
+        'consistent_kinematics': render_config.get('consistent_kinematics', False),
     }
 
     for name, camera in render_config['cameras'].items():
@@ -854,7 +879,7 @@ def verify_render_config(env, recorded, atol=1e-5):
             problems.append(f"{name}: fovy {got['fovy']} != {want['fovy']}")
 
     for key in ('image_height', 'image_width', 'visualize_info', 'pixel_recolor_arm',
-                'pixel_transparent_arm'):
+                'pixel_transparent_arm', 'consistent_kinematics'):
         if actual[key] != recorded[key]:
             problems.append(f'{key}: {actual[key]!r} != {recorded[key]!r}')
 
