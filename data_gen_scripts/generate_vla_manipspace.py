@@ -291,6 +291,17 @@ def collect_episode(env, agents, seed, ep_idx):
     unwrapped = env.unwrapped
     num_cubes = unwrapped._num_cubes
     rng = episode_rng(ep_idx)
+
+    # `CubePlanOracle` draws its plan noise from the *global* `np.random` (six call sites in
+    # `cube_plan.py`), which we cannot pass a generator to without patching upstream. So seed the
+    # global stream per episode from this episode's own generator: deterministic in the absolute
+    # index, decorrelated from the env seed, and unaffected by how many episodes precede it.
+    #
+    # Seeding it once per run instead -- which is what upstream does and what this script did --
+    # makes episode i depend on its position in the run, so the same index generated in two
+    # differently-sized runs produces different trajectories. That is exactly what breaks resuming.
+    np.random.seed(int(rng.integers(0, 2**31 - 1)))
+
     p_stack = p_stack_for_env(rng)
 
     ob, info = env.reset(seed=seed)
