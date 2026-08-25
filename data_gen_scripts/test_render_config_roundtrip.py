@@ -51,11 +51,15 @@ def build_reference():
 
 
 def rebuild_from(recorded):
-    """An env built from a recorded config alone, with nothing carried over from the original."""
+    """An env built from a recorded config alone, with nothing carried over from the original.
+
+    Note there is no `mode=` here: the helper supplies it from the record. Passing it as well is a
+    duplicate-keyword TypeError, which is deliberate -- `mode` changes dynamics, so a caller
+    hardcoding it is exactly the mistake worth failing on.
+    """
     env = gymnasium.make(
         ENV_ID,
         terminate_at_goal=False,
-        mode='data_collection',
         max_episode_steps=50,
         **render_config_to_kwargs(recorded),
     )
@@ -94,6 +98,7 @@ def main():
         ('front pos', lambda c: c['cameras']['front'].__setitem__('pos', [0.0, 0.0, 5.0])),
         ('visual_znear', lambda c: c.__setitem__('visual_znear', 0.5)),
         ('lighting', lambda c: c.__setitem__('lighting', None)),
+        ('mode', lambda c: c.__setitem__('mode', 'task')),
     ]:
         corrupted = copy.deepcopy(recorded)
         mutate(corrupted)
@@ -102,11 +107,13 @@ def main():
         except ValueError:
             continue
         failures.append(f'verify_render_config accepted a corrupted {field}')
-    print('negative cases: OK — a corrupted pose, fovy, znear or lighting is rejected')
+    print('negative cases: OK — a corrupted pose, fovy, znear, lighting or mode is rejected')
 
     # 4. `front` is fixed in the MJCF, so it is verified rather than rebuilt. Confirm the helper does
     #    not silently pretend to set it.
     kwargs = render_config_to_kwargs(recorded)
+    if kwargs.get('mode') != 'data_collection':
+        failures.append(f'render_config_to_kwargs did not carry mode through: {kwargs.get("mode")!r}')
     if 'front_camera' in kwargs:
         failures.append('render_config_to_kwargs invented a kwarg for the fixed `front` camera')
     if 'wrist_camera' not in kwargs:

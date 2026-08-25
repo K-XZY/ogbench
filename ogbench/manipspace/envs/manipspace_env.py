@@ -758,6 +758,11 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         return dict(
             cameras=cameras,
+            # Not a render setting either, but it demonstrably changes replayed dynamics: rebuilding
+            # in the default 'task' mode instead of 'data_collection' moved a replay off bit-exact.
+            # Recorded so the data identifies the mode that produced it rather than relying on
+            # everyone knowing which one we use.
+            mode=self._mode,
             # Not a render setting, but it changes the trajectories a run contains, so it belongs with
             # whatever identifies the data. See `set_control`.
             consistent_kinematics=self._consistent_kinematics,
@@ -826,6 +831,11 @@ def render_config_to_kwargs(render_config):
     are checked by `verify_render_config` instead of rebuilt.
     """
     kwargs = {
+        # `mode` is supplied here rather than left to the caller because it changes dynamics, and a
+        # caller who omits it silently gets the default 'task' and a replay that is no longer exact.
+        # A caller passing it too now gets a duplicate-keyword TypeError, which is the right failure:
+        # loud, immediate, and pointing at the line to delete.
+        'mode': render_config['mode'],
         'render_camera_names': list(render_config['cameras']),
         'width': render_config['image_width'],
         'height': render_config['image_height'],
@@ -879,7 +889,7 @@ def verify_render_config(env, recorded, atol=1e-5):
             problems.append(f"{name}: fovy {got['fovy']} != {want['fovy']}")
 
     for key in ('image_height', 'image_width', 'visualize_info', 'pixel_recolor_arm',
-                'pixel_transparent_arm', 'consistent_kinematics'):
+                'pixel_transparent_arm', 'consistent_kinematics', 'mode'):
         if actual[key] != recorded[key]:
             problems.append(f'{key}: {actual[key]!r} != {recorded[key]!r}')
 
