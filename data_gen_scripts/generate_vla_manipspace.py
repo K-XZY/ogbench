@@ -38,6 +38,12 @@ from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
 
 FLAGS = flags.FLAGS
 
+# Everything registered before this line belongs to absl or to an imported library. Diffing against
+# it after the definitions below yields exactly this module's flags, which is what config.yaml has to
+# capture. Looking the module up by `__file__` does not work -- absl keys by how the script was
+# invoked, so it silently returned nothing and froze an empty config for three runs.
+_PREEXISTING_FLAGS = frozenset(FLAGS)
+
 flags.DEFINE_integer('seed', 0, 'Base random seed; episode i uses seed + i.')
 flags.DEFINE_string('env_name', 'cube-triple-v0', 'Environment name.')
 flags.DEFINE_string('dataset_type', 'play', "Oracle flavour: 'play' or 'noisy'.")
@@ -56,6 +62,8 @@ flags.DEFINE_bool(
     'at the cost of dynamics that differ from upstream OGBench. Frozen into config.yaml either way.'
 )
 flags.DEFINE_bool('dry_run', False, 'Assemble and validate episodes without writing them.')
+
+OWN_FLAG_NAMES = tuple(sorted(frozenset(FLAGS) - _PREEXISTING_FLAGS))
 
 # Lane B owns the shard writer (plan section 5). Import it lazily so --dry_run works before it lands.
 WRITER_MODULE = 'goal_conditioned_vla.data.writer'
@@ -90,13 +98,27 @@ def collect_provenance(writer_mod, repo_root):
     return writer_mod.Provenance.collect(str(repo_root), allow_dirty=FLAGS.dry_run)
 
 
+# Without these in config.yaml a run cannot be told apart from another by reading it, which is the
+# whole point of freezing one. Checked rather than assumed, because the previous implementation
+# returned an empty dict and nothing noticed until someone went looking.
+REQUIRED_CONFIG_KEYS = ('env_name', 'dataset_type', 'num_episodes', 'seed', 'consistent_kinematics',
+                        'lighting', 'resolution', 'max_episode_steps')
+
+
 def run_config():
     """The full config, frozen to config.yaml by the writer. Section 3b: every run, no exceptions.
 
     This module's own flags only -- absl's logging flags are not part of what identifies a run.
     """
-    own = FLAGS.flags_by_module_dict().get(__file__, [])
-    return {flag.name: flag.value for flag in own}
+    config = {name: FLAGS[name].value for name in OWN_FLAG_NAMES}
+
+    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in config]
+    if missing:
+        raise RuntimeError(
+            f'run_config is missing {missing}; config.yaml would not identify this run. '
+            f'Captured {sorted(config)}'
+        )
+    return config
 
 
 def make_env():
