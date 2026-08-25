@@ -831,11 +831,6 @@ def render_config_to_kwargs(render_config):
     are checked by `verify_render_config` instead of rebuilt.
     """
     kwargs = {
-        # `mode` is supplied here rather than left to the caller because it changes dynamics, and a
-        # caller who omits it silently gets the default 'task' and a replay that is no longer exact.
-        # A caller passing it too now gets a duplicate-keyword TypeError, which is the right failure:
-        # loud, immediate, and pointing at the line to delete.
-        'mode': render_config['mode'],
         'render_camera_names': list(render_config['cameras']),
         'width': render_config['image_width'],
         'height': render_config['image_height'],
@@ -846,6 +841,14 @@ def render_config_to_kwargs(render_config):
         'pixel_transparent_arm': render_config['pixel_transparent_arm'],
         'consistent_kinematics': render_config.get('consistent_kinematics', False),
     }
+
+    # `mode` changes dynamics, so supply it from the record: a caller who omits it gets the default
+    # 'task' and a replay that is quietly no longer exact. Records written before `mode` was added --
+    # including the verified 50-episode trial -- do not carry it, and inventing a default here would
+    # be the implicit knowledge this field exists to remove. Omit it instead, leaving the caller to
+    # supply one and to say that it assumed.
+    if 'mode' in render_config:
+        kwargs['mode'] = render_config['mode']
 
     for name, camera in render_config['cameras'].items():
         kwarg = CONFIGURABLE_CAMERAS.get(name)
@@ -888,8 +891,14 @@ def verify_render_config(env, recorded, atol=1e-5):
         if abs(got['fovy'] - want['fovy']) > atol:
             problems.append(f"{name}: fovy {got['fovy']} != {want['fovy']}")
 
+    # A key absent from the record is *unverifiable*, not verified. Older records lack `mode`, and
+    # comparing against a key that isn't there would raise rather than report. Skipping keeps this
+    # usable on those records; the caller is responsible for stating what it assumed, which is why
+    # `render_config_to_kwargs` declines to invent a value.
     for key in ('image_height', 'image_width', 'visualize_info', 'pixel_recolor_arm',
                 'pixel_transparent_arm', 'consistent_kinematics', 'mode'):
+        if key not in recorded:
+            continue
         if actual[key] != recorded[key]:
             problems.append(f'{key}: {actual[key]!r} != {recorded[key]!r}')
 
