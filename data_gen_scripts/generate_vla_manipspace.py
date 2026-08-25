@@ -49,6 +49,11 @@ flags.DEFINE_string('env_name', 'cube-triple-v0', 'Environment name.')
 flags.DEFINE_string('dataset_type', 'play', "Oracle flavour: 'play' or 'noisy'.")
 flags.DEFINE_string('save_root', None, 'Root under which the timestamped run directory is created.')
 flags.DEFINE_integer('num_episodes', 50, 'Number of episodes to generate.')
+flags.DEFINE_integer(
+    'start_episode', 0,
+    'Absolute index of the first episode. A later run with --start_episode set to the end of an '
+    'earlier one extends the dataset without re-rolling or duplicating any episode.'
+)
 flags.DEFINE_integer('max_episode_steps', 1001, 'Cap on episode length.')
 flags.DEFINE_integer('resolution', 256, 'Master render resolution.')
 flags.DEFINE_float('noise', 0.1, 'Action noise level.')
@@ -101,8 +106,8 @@ def collect_provenance(writer_mod, repo_root):
 # Without these in config.yaml a run cannot be told apart from another by reading it, which is the
 # whole point of freezing one. Checked rather than assumed, because the previous implementation
 # returned an empty dict and nothing noticed until someone went looking.
-REQUIRED_CONFIG_KEYS = ('env_name', 'dataset_type', 'num_episodes', 'seed', 'consistent_kinematics',
-                        'lighting', 'resolution', 'max_episode_steps')
+REQUIRED_CONFIG_KEYS = ('env_name', 'dataset_type', 'num_episodes', 'start_episode', 'seed',
+                        'consistent_kinematics', 'lighting', 'resolution', 'max_episode_steps')
 
 
 def run_config():
@@ -169,19 +174,30 @@ def make_agents(env):
     return {'cube': CubePlanOracle(env=env, noise=FLAGS.noise, noise_smoothing=FLAGS.noise_smoothing)}
 
 
-def p_stack_for_env():
+def episode_rng(ep_idx):
+    """A generator determined by (seed, absolute episode index) and nothing else.
+
+    Every per-episode random quantity is drawn from here rather than from a single stream consumed
+    in order, so episode i is identical whichever run produced it and whatever else that run
+    generated. A sequential stream would make the same index depend on how many episodes preceded
+    it, which is exactly what makes a dataset impossible to extend later.
+    """
+    return np.random.default_rng([FLAGS.seed, ep_idx])
+
+
+def p_stack_for_env(rng):
     """Cube stacking probability, matching upstream's per-env ranges."""
     name = FLAGS.env_name
     if 'single' in name:
         return 0.0
     if 'double' in name:
-        return np.random.uniform(0.0, 0.25)
+        return float(rng.uniform(0.0, 0.25))
     if 'triple' in name:
-        return np.random.uniform(0.05, 0.35)
+        return float(rng.uniform(0.05, 0.35))
     if 'quadruple' in name:
-        return np.random.uniform(0.1, 0.5)
+        return float(rng.uniform(0.1, 0.5))
     if 'octuple' in name:
-        return np.random.uniform(0.0, 0.35)
+        return float(rng.uniform(0.0, 0.35))
     return 0.5
 
 
@@ -266,7 +282,7 @@ def read_frame(env, num_cubes):
     return row
 
 
-def collect_episode(env, agents, seed):
+def collect_episode(env, agents, seed, ep_idx):
     """Roll one episode out and assemble the schema record.
 
     Returns (arrays, meta). The frame/action alignment is the delicate part: frame t is the state
@@ -274,25 +290,26 @@ def collect_episode(env, agents, seed):
     """
     unwrapped = env.unwrapped
     num_cubes = unwrapped._num_cubes
-    p_stack = p_stack_for_env()
+    rng = episode_rng(ep_idx)
+    p_stack = p_stack_for_env(rng)
 
     ob, info = env.reset(seed=seed)
     agent = agents[info['privileged/target_task']]
     agent.reset(ob, info)
 
-    xi = np.random.uniform(0, FLAGS.noise) if FLAGS.dataset_type == 'noisy' else 0.0
+    xi = float(rng.uniform(0, FLAGS.noise)) if FLAGS.dataset_type == 'noisy' else 0.0
 
     frames = [read_frame(env, num_cubes)]
     actions = []
     done = False
 
     while not done and len(actions) < FLAGS.max_episode_steps:
-        if FLAGS.dataset_type == 'noisy' and np.random.rand() < FLAGS.p_random_action:
+        if FLAGS.dataset_type == 'noisy' and rng.random() < FLAGS.p_random_action:
             action = env.action_space.sample()
         else:
             action = np.array(agent.select_action(ob, info))
             if FLAGS.dataset_type == 'noisy':
-                action = action + np.random.normal(0, [xi, xi, xi, xi * 3, xi * 10], action.shape)
+                action = action + rng.normal(0, [xi, xi, xi, xi * 3, xi * 10], action.shape)
         action = np.clip(action, -1, 1)
 
         ob, _, terminated, truncated, info = env.step(action)
@@ -403,7 +420,6 @@ def main(_):
     GIT_SHA_OGBENCH = provenance.git_sha_ogbench
     mujoco_version = provenance.mujoco_version
 
-    np.random.seed(FLAGS.seed)
     env = make_env()
     agents = make_agents(env)
 
@@ -426,8 +442,11 @@ def main(_):
             )
             print(f'Run directory: {run_writer.run_dir}', flush=True)
 
-        for ep_idx in trange(FLAGS.num_episodes):
-            arrays, meta = collect_episode(env, agents, seed=FLAGS.seed + ep_idx)
+        first = FLAGS.start_episode
+        for ep_idx in trange(first, first + FLAGS.num_episodes):
+            # The env seed is a function of the absolute index, so episode i has the same initial
+            # state whichever run produced it.
+            arrays, meta = collect_episode(env, agents, seed=FLAGS.seed + ep_idx, ep_idx=ep_idx)
 
             if run_writer is None:
                 # Writing validates and raises; only the dry run has to check for itself.
@@ -438,7 +457,7 @@ def main(_):
                     )
             else:
                 run_writer.write_episode(arrays, meta, index=ep_idx)
-                if ep_idx == 0:
+                if ep_idx == first:
                     # One reference still per camera, for eyeballing the run later.
                     for cam in schema.CAMERAS:
                         run_writer.write_camera_reference(cam, arrays[f'image_{cam}'][0])
@@ -451,6 +470,8 @@ def main(_):
             env_id=FLAGS.env_name,
             oracle_type=FLAGS.dataset_type,
             num_episodes=FLAGS.num_episodes,
+            start_episode=FLAGS.start_episode,
+            episode_range=[first, first + FLAGS.num_episodes - 1],
             total_steps=total_steps,
             total_segments=total_segments,
             segment_success_rate=(total_successes / total_segments) if total_segments else 0.0,
